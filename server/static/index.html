@@ -297,6 +297,7 @@ function createPeerConnection() {
 
   peerConnection.onicecandidate = (event) => {
     if (event.candidate && ws) {
+      console.log('Sending ICE:', event.candidate.candidate.substring(0, 80));
       ws.send(JSON.stringify({
         type: 'ice',
         call_id: currentCallId,
@@ -308,8 +309,18 @@ function createPeerConnection() {
   };
 
   peerConnection.ontrack = (event) => {
+    console.log('Got remote track:', event.track.kind, event.streams.length, 'streams');
     const video = document.getElementById('remote-video');
-    video.srcObject = event.streams[0];
+    if (!video.srcObject) {
+      video.srcObject = event.streams[0];
+      video.play().then(() => console.log('Video playing')).catch(e => console.error('Play failed:', e));
+    }
+    event.track.onunmute = () => console.log('Track unmuted:', event.track.kind);
+    event.track.onended = () => console.log('Track ended:', event.track.kind);
+    // Log video dimensions once they're available
+    if (event.track.kind === 'video') {
+      video.onloadedmetadata = () => console.log('Video resolution:', video.videoWidth, 'x', video.videoHeight);
+    }
     // Video starts muted (browser autoplay policy). Click to unmute.
     video.onclick = () => {
       video.muted = !video.muted;
@@ -318,8 +329,21 @@ function createPeerConnection() {
     };
   };
 
+  peerConnection.oniceconnectionstatechange = () => {
+    console.log('ICE state:', peerConnection.iceConnectionState);
+  };
   peerConnection.onconnectionstatechange = () => {
     console.log('WebRTC state:', peerConnection.connectionState);
+    if (peerConnection.connectionState === 'connected') {
+      const video = document.getElementById('remote-video');
+      console.log('Video element:', 'srcObject:', !!video.srcObject, 'readyState:', video.readyState,
+        'paused:', video.paused, 'videoWidth:', video.videoWidth, 'videoHeight:', video.videoHeight);
+      if (video.srcObject) {
+        video.srcObject.getTracks().forEach(t =>
+          console.log('  Track:', t.kind, 'enabled:', t.enabled, 'muted:', t.muted, 'readyState:', t.readyState));
+      }
+      video.play().catch(e => console.error('Force play failed:', e));
+    }
   };
 }
 
@@ -365,7 +389,7 @@ function connectDashboard() {
         onCallEnded(data);
         break;
       case 'offer':
-        currentCallId = data.call_id;
+        if (data.call_id) currentCallId = data.call_id;
         await handleOffer(data);
         break;
       case 'ice':
