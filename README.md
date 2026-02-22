@@ -1,5 +1,9 @@
 # Visual911
 
+<div align="center">
+  <img src="public/VISUAL911.jpg" alt="Visual911 Banner" width="100%">
+</div>
+
 A community-aware emergency response system. One SOS call alerts everyone nearby, gives dispatchers live video and AI triage, and lets the community know in real time when help is needed.
 
 ---
