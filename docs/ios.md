@@ -4,18 +4,18 @@
 
 The iOS app is a Swift/SwiftUI application that manages the full call lifecycle. It coordinates three hardware subsystems (Presage camera, WebRTC camera, AVAudioEngine microphone), three WebSocket connections to the Vultr server, and one P2P WebRTC connection to the dispatcher browser.
 
-Physical device required. Simulator has no camera.
+Physical device required. Simulator has no camera. Built with XcodeGen from `project.yml`.
 
 ---
 
 ## Dependencies
 
-Add via Swift Package Manager:
+Add via Swift Package Manager (defined in `project.yml`):
 
-| Package | URL | Purpose |
-|---|---|---|
-| SmartSpectra iOS SDK | `https://github.com/Presage-Security/SmartSpectra-iOS-SDK` | Contactless vitals |
-| WebRTC | `https://github.com/stasel/WebRTC.git` branch: `latest` | P2P video/audio |
+| Package | URL | Version | Purpose |
+|---|---|---|---|
+| SmartSpectra | `https://github.com/Presage-Security/SmartSpectra` | `>= 1.0.0` | Contactless vitals |
+| WebRTC | `https://github.com/stasel/WebRTC` | `>= 125.0.0` | P2P video/audio |
 
 ---
 
@@ -23,17 +23,26 @@ Add via Swift Package Manager:
 
 ```
 ios/
-├── Config.swift              # API keys, server URLs — never commit real values
-├── CallManager.swift         # Central state machine, owns all subsystems
-├── PresageManager.swift      # Presage SDK wrapper
-├── WebRTCManager.swift       # RTCPeerConnection, capturer, data handling
-├── AudioTap.swift            # AVAudioEngine tap → /ws/audio WebSocket
-├── SignalingClient.swift     # /ws/signal WebSocket
-├── VitalsClient.swift        # /ws/vitals WebSocket
+├── project.yml               # XcodeGen project definition
+├── Config.swift               # Server URLs — reads API key from Secrets.swift
+├── Secrets.swift              # Presage API key (gitignored)
+├── Secrets.swift.example      # Template for Secrets.swift
+├── TURNCredentials.swift      # HMAC-based TURN credential generation
+├── CallManager.swift          # Central state machine, owns all subsystems
+├── PresageManager.swift       # Presage SDK wrapper with ScanFeedback
+├── WebRTCManager.swift        # RTCPeerConnection, capturer, FrameGrabber
+├── AudioTap.swift             # AVAudioEngine tap → /ws/audio WebSocket
+├── SignalingClient.swift      # /ws/signal WebSocket
+├── VitalsClient.swift         # /ws/vitals WebSocket
+├── ContentView.swift          # Root view — switches on CallState
+├── Visual911App.swift         # @main App entry point
 └── Views/
-    ├── IdleView.swift        # SOS button, "monitoring ready" state
-    ├── ScanningView.swift    # Presage vitals scan in progress
-    └── ActiveCallView.swift  # Connected call, vitals readout, end button
+    ├── IdleView.swift         # SOS button, greeting, location display
+    ├── ScanningView.swift     # Camera preview, SDK feedback, vitals cards
+    ├── InitiatingView.swift   # "Vitals Captured" confirmation, waiting for dispatcher
+    ├── ActiveCallView.swift   # Full-screen local video, mute/end controls
+    ├── RTCLocalVideoView.swift # UIViewRepresentable for RTCMTLVideoView
+    └── EKGLogoView.swift      # EKG waveform logo matching web app
 ```
 
 ---
@@ -42,9 +51,8 @@ ios/
 
 ```swift
 enum Config {
-    static let presageApiKey = "YOUR_PRESAGE_KEY"
-    static let geminiApiKey  = ""  // Never set here — server-side only
-    static let serverHost    = "wss://yourdomain.com"
+    static let presageApiKey = Secrets.presageApiKey
+    static let serverHost    = "wss://visual911.mooo.com"
 
     // WebSocket endpoints
     static let signalURL  = "\(serverHost)/ws/signal"
@@ -53,15 +61,28 @@ enum Config {
 }
 ```
 
+API key is stored in `Secrets.swift` (gitignored). Copy `Secrets.swift.example` and fill in real values.
+
 ---
 
 ## CallManager.swift
 
-Central coordinator. Owns the state machine and holds references to all subsystems.
+Central coordinator. Owns the state machine and holds references to all subsystems. Key features beyond the basic lifecycle:
+
+- **Smart scan completion**: Scan finishes early when both HR and BR signals stabilize (minimum 5s, 2s error cooldown), or hard-times out at 15s
+- **Scan feedback**: Real-time `ScanFeedback` from Presage SDK status codes (face not found, too dark, etc.) and vitals signal stability
+- **Retry scan**: User can restart the scan if conditions are poor
+- **Vitals timing**: Sends `call_initiated` first, then vitals 0.3s later to avoid race condition on server
+- **Mute toggle**: Controls WebRTC audio track enable/disable
+- **Thread-safe cleanup**: `endCall()` guards against re-entrant calls (ICE failed + signaling race) and always runs on main thread
+- **Transient ICE handling**: ICE `.disconnected` doesn't trigger teardown (may recover); only `.failed` ends the call
+- **Vitals resend on connect**: Resends cached vitals when ICE reaches `.connected` state
 
 ```swift
 import SwiftUI
 import Combine
+import CoreLocation
+import WebRTC
 
 enum CallState {
     case idle
@@ -75,6 +96,10 @@ enum CallState {
 class CallManager: ObservableObject {
     @Published var state: CallState = .idle
     @Published var lastVitals: VitalsReading?
+    @Published var lastLocation: CLLocationCoordinate2D?
+    @Published var isMuted: Bool = false
+    @Published var scanFeedback: ScanFeedback?
+    @Published var scanComplete: Bool = false
 
     private var callId: String?
     private let presage = PresageManager()
@@ -84,154 +109,65 @@ class CallManager: ObservableObject {
     private var vitalsClient: VitalsClient?
     private var locationManager = CLLocationManager()
     private var cancellables = Set<AnyCancellable>()
+    private var scanTimeoutWork: DispatchWorkItem?
+    private var scanStartTime: Date?
+    private var lastErrorTime: Date?
+    private let minScanDuration: TimeInterval = 5.0
+    private let errorCooldown: TimeInterval = 2.0
 
-    func onSOSPressed() {
-        guard state == .idle else { return }
-        callId = UUID().uuidString
-        transition(to: .scanning)
-        startPresageScan()
-    }
-
-    private func startPresageScan() {
-        presage.startMeasuring()
-
-        // Listen for first confident reading
-        presage.$latestReading
-            .compactMap { $0 }
-            .filter { $0.hrConfidence > 0.7 }
-            .first()
-            .sink { [weak self] reading in
-                self?.lastVitals = reading
-            }
-            .store(in: &cancellables)
-
-        // Stop after 15 seconds regardless
-        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
-            self?.presage.stopMeasuring()
-            self?.initiateCall()
-        }
-    }
-
-    private func initiateCall() {
-        guard let callId else { return }
-        // Proceed even without location — send zeros so the server doesn't block.
-        // The map pin will be missing but the call still works.
-        let location = currentLocation()
-        let locationDict: [String: Any] = location.map {
-            ["lat": $0.latitude, "lng": $0.longitude]
-        } ?? [:]
-
-        transition(to: .initiating)
-
-        signalingClient = SignalingClient(callId: callId, delegate: self)
-        vitalsClient = VitalsClient(callId: callId)
-        audioTap = AudioTap(callId: callId)
-
-        signalingClient?.connect()
-        vitalsClient?.connect()
-        audioTap?.start()
-
-        // Send cached vitals from the Presage scan immediately
-        if let vitals = lastVitals {
-            vitalsClient?.send(reading: vitals)
-        }
-
-        signalingClient?.send([
-            "type": "call_initiated",
-            "call_id": callId,
-            "location": locationDict
-        ])
-    }
-
-    func onDispatcherReady() {
-        // Called by SignalingClient delegate when server sends dispatcher_ready
-        transition(to: .connecting)
-        let webrtc = WebRTCManager(delegate: self)
-        self.webrtc = webrtc
-        webrtc.createOffer { [weak self] sdp in
-            self?.signalingClient?.send(sdp)
-        }
-    }
-
-    func endCall(reason: String = "caller_ended") {
-        transition(to: .cleanup)
-        signalingClient?.send(["type": "call_ended", "call_id": callId ?? ""])
-        signalingClient?.disconnect()
-        vitalsClient?.disconnect()
-        audioTap?.stop()
-        webrtc?.disconnect()
-        presage.stopMeasuring()
-        callId = nil
-        transition(to: .idle)
-    }
-
-    private func currentLocation() -> CLLocationCoordinate2D? {
-        locationManager.requestWhenInUseAuthorization()
-        let loc = locationManager.location
-        guard let loc, loc.horizontalAccuracy >= 0 else { return nil }
-        return loc.coordinate
-    }
-
-    private func transition(to newState: CallState) {
-        DispatchQueue.main.async { self.state = newState }
-    }
-}
-
-// MARK: — SignalingClientDelegate
-
-extension CallManager: SignalingClientDelegate {
-    func signalingClient(_ client: SignalingClient, didReceive message: [String: Any]) {
-        guard let type = message["type"] as? String else { return }
-        switch type {
-        case "dispatcher_ready":
-            onDispatcherReady()
-        case "call_ended":
-            endCall(reason: message["reason"] as? String ?? "remote_ended")
-        case "offer", "answer":
-            webrtc?.handleRemoteSDP(message)
-        case "ice":
-            webrtc?.handleRemoteCandidate(message)
-        default:
-            break
-        }
-    }
-}
-
-// MARK: — WebRTCManagerDelegate
-
-extension CallManager: WebRTCManagerDelegate {
-    func webRTCManager(_ manager: WebRTCManager, didGenerateCandidate candidate: RTCIceCandidate) {
-        signalingClient?.send([
-            "type": "ice",
-            "call_id": callId ?? "",
-            "candidate": candidate.sdp,
-            "sdpMid": candidate.sdpMid ?? "",
-            "sdpMLineIndex": candidate.sdpMLineIndex
-        ])
-    }
-
-    func webRTCManager(_ manager: WebRTCManager, didChangeConnectionState state: RTCIceConnectionState) {
-        switch state {
-        case .connected, .completed:
-            transition(to: .active)
-        case .failed, .disconnected:
-            endCall(reason: "connection_failed")
-        default:
-            break
-        }
-    }
-
-    func webRTCManager(_ manager: WebRTCManager, didProduceSDP sdp: [String: Any]) {
-        signalingClient?.send(sdp)
-    }
+    func onSOSPressed() { ... }
+    private func startPresageScan() { ... }
+    private func tryFinishScan() { ... }
+    private func finishScan() { ... }
+    func retryScan() { ... }
+    private func initiateCall() { ... }
+    func onDispatcherReady() { ... }
+    func toggleMute() { ... }
+    func renderLocalVideo(to renderer: RTCVideoRenderer) { ... }
+    func endCall(reason: String = "caller_ended") { ... }
 }
 ```
+
+### Scan Logic
+
+The scan has three ways to finish:
+1. **Early finish** (`tryFinishScan`): Both `hrStable` and `brStable` are true, minimum 5s has passed, no SDK error active, no error in last 2s
+2. **Hard timeout**: 15 seconds regardless of quality
+3. **User retry** (`retryScan`): Cancels and restarts the scan
+
+SDK status codes (face position, lighting) take priority over vitals-based feedback. Positive "Signal stable" feedback is only shown when the SDK isn't reporting an error.
+
+### Call Lifecycle
+
+On `initiateCall()`:
+1. Opens signaling, vitals, and audio WebSockets
+2. Sends `call_initiated` with location
+3. After 0.3s delay, sends cached vitals (if any)
+
+On `onDispatcherReady()`:
+1. Transitions to `.connecting`
+2. Creates `WebRTCManager`, links it to `AudioTap` for frame capture
+3. Creates WebRTC offer
+
+On `endCall()`:
+1. Guards: must be on main thread, must not already be in `.cleanup`/`.idle`
+2. Captures and nils all subsystem references atomically
+3. Sends `call_ended`, disconnects everything, resets all state
+
+### Delegate Extensions
+
+```swift
+// SignalingClientDelegate — handles dispatcher_ready, call_ended, SDP, ICE
+// WebRTCManagerDelegate — handles ICE candidates, connection state changes, SDP
+```
+
+ICE `.disconnected` is treated as transient (logged but not acted on). Only `.failed` triggers `endCall()`. On `.connected`/`.completed`, vitals are resent to ensure the dispatcher gets them.
 
 ---
 
 ## PresageManager.swift
 
-Wraps `SmartSpectraSwiftSDK.shared`. Publishes readings for CallManager to observe.
+Wraps `SmartSpectraSwiftSDK.shared` and `SmartSpectraVitalsProcessor.shared`. Publishes readings and scan feedback.
 
 ```swift
 import SmartSpectraSwiftSDK
@@ -239,54 +175,57 @@ import Combine
 
 struct VitalsReading {
     let hr: Double
-    let hrConfidence: Double
+    let hrStable: Bool
     let breathing: Double
-    let breathingConfidence: Double
+    let brStable: Bool
     let timestamp: Date
+}
+
+struct ScanFeedback: Equatable {
+    let icon: String      // SF Symbol name
+    let message: String   // User-facing text
+    let isError: Bool     // true = problem, false = informational
+
+    static func from(_ code: StatusCode) -> ScanFeedback? { ... }
+
+    // Vitals-driven feedback (not from SDK status)
+    static let signalStable = ScanFeedback(icon: "checkmark.circle.fill", message: "Signal stable — measuring vitals", isError: false)
+    static let signalWeak = ScanFeedback(icon: "exclamationmark.triangle.fill", message: "Weak signal — hold still in good lighting", isError: true)
 }
 
 class PresageManager: ObservableObject {
     @Published var latestReading: VitalsReading?
-    private var sdk = SmartSpectraSwiftSDK.shared
-    private var cancellables = Set<AnyCancellable>()
+    @Published var scanFeedback: ScanFeedback?
+    private let sdk = SmartSpectraSwiftSDK.shared
+    private let processor = SmartSpectraVitalsProcessor.shared
 
     init() {
         sdk.setApiKey(Config.presageApiKey)
+        sdk.setSmartSpectraMode(.continuous)
+        sdk.setCameraPosition(.front)
+        sdk.setImageOutputEnabled(true)  // enables camera preview via processor.imageOutput
     }
 
     func startMeasuring() {
-        sdk.startMeasuring()
-
-        // Observe MetricsBuffer updates
-        sdk.$metricsBuffer
-            .compactMap { $0 }
-            .sink { [weak self] buffer in
-                guard
-                    let hrVal = buffer.pulse.rate.last,
-                    let breathVal = buffer.breathing.rate.last
-                else { return }
-
-                let reading = VitalsReading(
-                    hr: hrVal.value,
-                    hrConfidence: hrVal.confidence,
-                    breathing: breathVal.value,
-                    breathingConfidence: breathVal.confidence,
-                    timestamp: Date()
-                )
-                DispatchQueue.main.async {
-                    self?.latestReading = reading
-                }
-            }
-            .store(in: &cancellables)
+        processor.startProcessing()
+        processor.startRecording()
+        // Observes processor.$lastStatusCode → scanFeedback
+        // Observes sdk.$metricsBuffer → latestReading (with .dropFirst() to skip stale values)
     }
 
     func stopMeasuring() {
-        sdk.stopMeasuring()
+        processor.stopRecording()
+        processor.stopProcessing()
     }
 }
 ```
 
-**Note:** Check the actual `MetricsBuffer` property names against the SDK source. The `pulse.rate` / `breathing.rate` path is based on the documented structure — verify against `SmartSpectra-iOS-SDK` repo before building.
+**Key SDK details:**
+- `.ok` status is NOT used for positive feedback — it's unreliable (can report `.ok` while C++ layer logs "too dark")
+- Positive feedback comes from vitals signal stability (`hrStable`/`brStable`) instead
+- Status codes handled: `imageTooDark`, `imageTooBright`, `noFacesFound`, `moreThanOneFaceFound`, `faceNotCentered`, `faceTooBigOrTooSmall`, `chestTooFarOrNotEnoughShowing`
+- Uses `.dropFirst()` on metricsBuffer to skip stale initial value from previous session
+- `setImageOutputEnabled(true)` provides camera preview via `processor.imageOutput` (UIImage)
 
 ---
 
@@ -296,139 +235,49 @@ Manages `RTCPeerConnection` and `RTCCameraVideoCapturer`. After Presage stops, t
 
 ```swift
 import WebRTC
-
-protocol WebRTCManagerDelegate: AnyObject {
-    func webRTCManager(_ manager: WebRTCManager, didGenerateCandidate candidate: RTCIceCandidate)
-    func webRTCManager(_ manager: WebRTCManager, didChangeConnectionState state: RTCIceConnectionState)
-    func webRTCManager(_ manager: WebRTCManager, didProduceSDP sdp: [String: Any])
-}
+import UIKit
 
 class WebRTCManager: NSObject {
     weak var delegate: WebRTCManagerDelegate?
-
-    private static let factory: RTCPeerConnectionFactory = {
-        RTCInitializeSSL()
-        return RTCPeerConnectionFactory()
-    }()
-
     private var peerConnection: RTCPeerConnection!
     private var capturer: RTCCameraVideoCapturer?
     private var localVideoTrack: RTCVideoTrack?
+    private let frameGrabber = FrameGrabber()
 
-    init(delegate: WebRTCManagerDelegate) {
-        self.delegate = delegate
-        super.init()
-        setupPeerConnection()
-        setupLocalMedia()
-    }
+    // ... setup, offer/answer, ICE handling ...
 
-    private func setupPeerConnection() {
-        let config = RTCConfiguration()
-        config.iceServers = [
-            RTCIceServer(urlStrings: ["stun:yourdomain.com:3478"]),
-            RTCIceServer(
-                urlStrings: ["turn:yourdomain.com:3478"],
-                username: generatedTURNUsername(),
-                credential: generatedTURNCredential()
-            )
-        ]
-        config.sdpSemantics = .unifiedPlan
-        config.continualGatheringPolicy = .gatherContinually
-
-        let constraints = RTCMediaConstraints(
-            mandatoryConstraints: nil,
-            optionalConstraints: ["DtlsSrtpKeyAgreement": "true"]
-        )
-
-        peerConnection = WebRTCManager.factory.peerConnection(
-            with: config,
-            constraints: constraints,
-            delegate: self
-        )
-    }
-
-    private func setupLocalMedia() {
-        // Audio
-        let audioConstraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
-        let audioSource = WebRTCManager.factory.audioSource(with: audioConstraints)
-        let audioTrack = WebRTCManager.factory.audioTrack(with: audioSource, trackId: "audio0")
-        peerConnection.add(audioTrack, streamIds: ["stream0"])
-
-        // Video
-        let videoSource = WebRTCManager.factory.videoSource()
-        localVideoTrack = WebRTCManager.factory.videoTrack(with: videoSource, trackId: "video0")
-        peerConnection.add(localVideoTrack!, streamIds: ["stream0"])
-
-        // Start front camera capture
-        capturer = RTCCameraVideoCapturer(delegate: videoSource)
-        guard let frontCamera = RTCCameraVideoCapturer.captureDevices().first(where: { $0.position == .front }),
-              let format = RTCCameraVideoCapturer.supportedFormats(for: frontCamera)
-                .sorted(by: { CMVideoFormatDescriptionGetDimensions($0.formatDescription).width <
-                              CMVideoFormatDescriptionGetDimensions($1.formatDescription).width })
-                .last,
-              let fps = format.videoSupportedFrameRateRanges.max(by: { $0.maxFrameRate < $1.maxFrameRate })
-        else { return }
-
-        capturer?.startCapture(with: frontCamera, format: format, fps: Int(fps.maxFrameRate))
-    }
-
-    func createOffer(completion: @escaping ([String: Any]) -> Void) {
-        let constraints = RTCMediaConstraints(
-            mandatoryConstraints: [
-                kRTCMediaConstraintsOfferToReceiveAudio: kRTCMediaConstraintsValueTrue,
-                kRTCMediaConstraintsOfferToReceiveVideo: kRTCMediaConstraintsValueTrue
-            ],
-            optionalConstraints: nil
-        )
-        peerConnection.offer(for: constraints) { [weak self] sdp, error in
-            guard let sdp else { return }
-            self?.peerConnection.setLocalDescription(sdp) { _ in
-                completion(["type": "offer", "sdp": sdp.sdp])
-            }
-        }
-    }
-
-    func handleRemoteSDP(_ dict: [String: Any]) {
-        guard let typeStr = dict["type"] as? String,
-              let sdpStr = dict["sdp"] as? String else { return }
-        let type: RTCSdpType = typeStr == "offer" ? .offer : .answer
-        let sdp = RTCSessionDescription(type: type, sdp: sdpStr)
-        peerConnection.setRemoteDescription(sdp) { _ in }
-    }
-
-    func handleRemoteCandidate(_ dict: [String: Any]) {
-        guard let sdp = dict["candidate"] as? String,
-              let sdpMid = dict["sdpMid"] as? String,
-              let sdpMLineIndex = dict["sdpMLineIndex"] as? Int32 else { return }
-        let candidate = RTCIceCandidate(sdp: sdp, sdpMLineIndex: sdpMLineIndex, sdpMid: sdpMid)
-        peerConnection.add(candidate) { _ in }
-    }
-
-    func renderLocalVideo(to renderer: RTCVideoRenderer) {
-        localVideoTrack?.add(renderer)
-    }
-
-    func disconnect() {
-        capturer?.stopCapture()
-        peerConnection.close()
-    }
+    func captureJPEG() -> Data? { frameGrabber.captureJPEG() }
+    func setAudioMuted(_ muted: Bool) { ... }
+    func renderLocalVideo(to renderer: RTCVideoRenderer) { ... }
 }
+```
 
-extension WebRTCManager: RTCPeerConnectionDelegate {
-    func peerConnection(_ peerConnection: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {
-        delegate?.webRTCManager(self, didGenerateCandidate: candidate)
-    }
-    func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
-        delegate?.webRTCManager(self, didChangeConnectionState: newState)
-    }
-    // Implement remaining required stubs (didChange signaling state, etc.)
-    func peerConnection(_ peerConnection: RTCPeerConnection, didChange stateChanged: RTCSignalingState) {}
-    func peerConnection(_ peerConnection: RTCPeerConnection, didAdd stream: RTCMediaStream) {}
-    func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {}
-    func peerConnectionShouldNegotiate(_ peerConnection: RTCPeerConnection) {}
-    func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {}
-    func peerConnection(_ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {}
-    func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {}
+### Key differences from docs template:
+
+**ICE Servers** use Google STUN servers plus the project TURN server:
+```swift
+config.iceServers = [
+    RTCIceServer(urlStrings: ["stun:stun.l.google.com:19302"]),
+    RTCIceServer(urlStrings: ["stun:stun1.l.google.com:19302"]),
+    RTCIceServer(
+        urlStrings: ["turn:visual911.mooo.com:3478", "turns:visual911.mooo.com:5349"],
+        username: generatedTURNUsername(),
+        credential: generatedTURNCredential()
+    ),
+]
+```
+
+**Camera resolution**: Picks format closest to 1280x720 (not highest available) to avoid overwhelming the WebRTC encoder.
+
+**Camera retry**: Retries camera start up to 3 times with 1s delay on failure.
+
+**`createOffer`** takes a `callId` parameter (included in the SDP message).
+
+**FrameGrabber**: A private `RTCVideoRenderer` class that retains the latest `CVPixelBuffer` from the video track and converts it to JPEG on demand:
+```swift
+private class FrameGrabber: NSObject, RTCVideoRenderer {
+    func renderFrame(_ frame: RTCVideoFrame?) { /* retain CVPixelBuffer */ }
+    func captureJPEG(compressionQuality: CGFloat = 0.5) -> Data? { /* CIImage → UIImage → JPEG */ }
 }
 ```
 
@@ -436,165 +285,50 @@ extension WebRTCManager: RTCPeerConnectionDelegate {
 
 ## AudioTap.swift
 
-Runs parallel to WebRTC audio. Taps the microphone via AVAudioEngine and streams 16kHz mono PCM to `/ws/audio`. Also sends periodic JPEG frames for Gemini scene awareness.
+Runs parallel to WebRTC audio. Taps the microphone via AVAudioEngine and streams 16kHz mono PCM to `/ws/audio`. Also sends periodic JPEG frames for Gemini scene awareness using a weak reference to `WebRTCManager`.
 
 ```swift
-import AVFoundation
-
 class AudioTap {
     private let callId: String
     private var engine = AVAudioEngine()
     private var webSocket: URLSessionWebSocketTask?
     private var frameTimer: Timer?
-    private var session: URLSession
-
-    init(callId: String) {
-        self.callId = callId
-        self.session = URLSession(configuration: .default)
-    }
+    weak var webRTCManager: WebRTCManager?  // Set by CallManager after WebRTC init
 
     func start() {
-        setupAudioSession()
-        connectWebSocket()
-        setupEngine()
-        scheduleFrames()
-    }
-
-    private func setupAudioSession() {
-        let audioSession = AVAudioSession.sharedInstance()
-        try? audioSession.setCategory(.playAndRecord, options: [.mixWithOthers, .allowBluetooth])
-        try? audioSession.setActive(true)
-
-        // Reinstall tap if route changes (e.g. headphones plugged in)
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleRouteChange),
-            name: AVAudioSession.routeChangeNotification,
-            object: nil
-        )
-    }
-
-    private func connectWebSocket() {
-        guard let url = URL(string: "\(Config.audioURL)?call_id=\(callId)") else { return }
-        webSocket = session.webSocketTask(with: url)
-        webSocket?.resume()
-    }
-
-    private func setupEngine() {
-        let inputNode = engine.inputNode
-        let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true)!
-
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputNode.outputFormat(forBus: 0)) { [weak self] buffer, _ in
-            guard let self, let converted = self.convert(buffer: buffer, to: format) else { return }
-            let data = Data(buffer: converted.int16ChannelData![0].withMemoryRebound(to: UInt8.self, capacity: Int(converted.frameLength) * 2) {
-                UnsafeBufferPointer(start: $0, count: Int(converted.frameLength) * 2)
-            })
-            self.webSocket?.send(.data(data)) { _ in }
-        }
-
-        try? engine.start()
-    }
-
-    private func convert(buffer: AVAudioPCMBuffer, to format: AVAudioFormat) -> AVAudioPCMBuffer? {
-        guard let converter = AVAudioConverter(from: buffer.format, to: format) else { return nil }
-        let frameCount = AVAudioFrameCount(format.sampleRate / buffer.format.sampleRate * Double(buffer.frameLength))
-        guard let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return nil }
-        var error: NSError?
-        converter.convert(to: output, error: &error) { _, status in
-            status.pointee = .haveData
-            return buffer
-        }
-        return error == nil ? output : nil
-    }
-
-    private func scheduleFrames() {
-        // Capture a JPEG snapshot every 2 seconds for Gemini scene awareness
-        frameTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.captureAndSendFrame()
-        }
+        setupAudioSession()   // .playAndRecord + .mixWithOthers
+        connectWebSocket()    // /ws/audio?call_id=...
+        setupEngine()         // AVAudioEngine tap → 16kHz PCM → WebSocket
+        scheduleFrames()      // Timer every 2s → captureAndSendFrame()
     }
 
     private func captureAndSendFrame() {
-        // Capture snapshot from the current camera session
-        // In practice: grab from a shared RTCVideoRenderer or AVCaptureVideoDataOutput tap
-        // For hackathon: use a UIScreen snapshot of the local preview view
-        // See ios.md notes on frame capture approach
-    }
-
-    @objc private func handleRouteChange(_ notification: Notification) {
-        engine.inputNode.removeTap(onBus: 0)
-        setupEngine()
-    }
-
-    func stop() {
-        frameTimer?.invalidate()
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        webSocket?.cancel()
-        NotificationCenter.default.removeObserver(self)
+        guard let jpeg = webRTCManager?.captureJPEG() else { return }
+        // Send as JSON: { "type": "frame", "data": "<base64>" }
     }
 }
 ```
 
-**Frame capture note:** The simplest hackathon approach for JPEG frames is to render the local WebRTC video track to an offscreen `RTCMTLVideoView` and take a UIGraphicsImageRenderer snapshot every 2 seconds. This is a bit hacky but works. A cleaner approach would be a custom `RTCVideoRenderer` that retains the last `CVPixelBuffer` and converts it to JPEG on demand.
+**Note:** WebSocket requests include `ngrok-skip-browser-warning: true` header for development via ngrok tunnels.
 
 ---
 
 ## SignalingClient.swift
 
-WebSocket wrapper for `/ws/signal`. Forwards raw JSON between iOS and the server (which in turn forwards to the dispatcher dashboard).
+WebSocket wrapper for `/ws/signal`. Forwards raw JSON between iOS and the server.
 
 ```swift
-import Foundation
-
-protocol SignalingClientDelegate: AnyObject {
-    func signalingClient(_ client: SignalingClient, didReceive message: [String: Any])
-}
-
 class SignalingClient: NSObject {
     weak var delegate: SignalingClientDelegate?
     private let callId: String
     private var webSocket: URLSessionWebSocketTask?
-    private var session: URLSession
-
-    init(callId: String, delegate: SignalingClientDelegate) {
-        self.callId = callId
-        self.delegate = delegate
-        self.session = URLSession(configuration: .default)
-    }
 
     func connect() {
-        guard let url = URL(string: "\(Config.signalURL)?call_id=\(callId)&role=caller") else { return }
-        webSocket = session.webSocketTask(with: url)
-        webSocket?.resume()
-        receive()
+        // URL: Config.signalURL?call_id=...&role=caller
+        // Includes ngrok-skip-browser-warning header
     }
-
-    private func receive() {
-        webSocket?.receive { [weak self] result in
-            switch result {
-            case .success(let message):
-                if case .string(let text) = message,
-                   let data = text.data(using: .utf8),
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    self?.delegate?.signalingClient(self!, didReceive: json)
-                }
-                self?.receive()  // Continue listening
-            case .failure:
-                break  // Handle reconnection if needed
-            }
-        }
-    }
-
-    func send(_ dict: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: dict),
-              let text = String(data: data, encoding: .utf8) else { return }
-        webSocket?.send(.string(text)) { _ in }
-    }
-
-    func disconnect() {
-        webSocket?.cancel()
-    }
+    func send(_ dict: [String: Any]) { ... }
+    func disconnect() { ... }
 }
 ```
 
@@ -602,69 +336,66 @@ class SignalingClient: NSObject {
 
 ## VitalsClient.swift
 
-Sends vitals JSON to `/ws/vitals` after the Presage scan completes. Called once at call start with the cached `lastVitals` reading, then periodically if new readings arrive (though Presage is stopped, so in practice just the one initial send).
+Sends vitals JSON to `/ws/vitals`. Called once at call start with cached vitals from the Presage scan. Resent on WebRTC connect to ensure dispatcher receives them.
 
 ```swift
-import Foundation
-
 class VitalsClient {
-    private let callId: String
-    private var webSocket: URLSessionWebSocketTask?
-    private let session = URLSession(configuration: .default)
-
-    init(callId: String) {
-        self.callId = callId
-    }
-
-    func connect() {
-        guard let url = URL(string: "\(Config.vitalsURL)?call_id=\(callId)") else { return }
-        webSocket = session.webSocketTask(with: url)
-        webSocket?.resume()
-    }
-
     func send(reading: VitalsReading) {
+        // Converts hrStable/brStable to confidence values:
+        // stable → 1.0, unstable → 0.5 (not 0.0, so dashboard still shows the value)
         let payload: [String: Any] = [
             "type": "vitals",
             "call_id": callId,
             "hr": reading.hr,
-            "hrConfidence": reading.hrConfidence,
+            "hrConfidence": reading.hrStable ? 1.0 : 0.5,
             "breathing": reading.breathing,
-            "breathingConfidence": reading.breathingConfidence,
+            "breathingConfidence": reading.brStable ? 1.0 : 0.5,
             "timestamp": reading.timestamp.timeIntervalSince1970
         ]
-        guard let data = try? JSONSerialization.data(withJSONObject: payload),
-              let text = String(data: data, encoding: .utf8) else { return }
-        webSocket?.send(.string(text)) { _ in }
-    }
-
-    func disconnect() {
-        webSocket?.cancel()
     }
 }
 ```
 
-Call `vitalsClient?.send(reading: lastVitals)` from `CallManager.initiateCall()` after `vitalsClient?.connect()`.
+---
+
+## Views
+
+### ContentView.swift
+
+Root view that switches based on `CallState`:
+
+| State | View |
+|---|---|
+| `.idle` | `IdleView` — SOS button, greeting, reverse-geocoded location |
+| `.scanning` | `ScanningView` — Camera preview, SDK feedback banner, vitals cards, progress bar |
+| `.initiating`, `.connecting` | `InitiatingView` — Checkmark, captured vitals summary, location, "Waiting for dispatcher" |
+| `.active` | `ActiveCallView` — Full-screen local video, mute/end call buttons |
+| `.cleanup` | ProgressView "Ending call…" |
+
+### ScanningView.swift
+
+Uses `SmartSpectraVitalsProcessor.shared.imageOutput` for the camera preview (UIImage from the Presage SDK). Displays:
+- Mirrored camera preview
+- Scan feedback banner (red for errors, green for stable signal) — driven by `callManager.scanFeedback`
+- Progress bar (0–15s with snap-to-full on early completion via `scanComplete`)
+- Vitals cards showing HR and BR with stability indicators
+
+### InitiatingView.swift
+
+Shows captured vitals in compact side-by-side cards, GPS coordinates, and a cancel button. Displays "Waiting for dispatcher to answer..." with an amber status dot.
+
+### ActiveCallView.swift
+
+Full-screen `RTCLocalVideoView` (Metal renderer) with overlay controls:
+- Mute/Unmute button
+- End call button
+- "Dispatcher can see your video and location" label
 
 ---
 
-## Info.plist Requirements
+## TURNCredentials.swift
 
-```xml
-<key>NSCameraUsageDescription</key>
-<string>Visual911 uses the camera to measure your vital signs and share video with emergency responders.</string>
-
-<key>NSMicrophoneUsageDescription</key>
-<string>Visual911 uses the microphone to share audio with emergency responders and AI triage.</string>
-
-<key>NSLocationWhenInUseUsageDescription</key>
-<string>Visual911 shares your location with emergency responders.</string>
-```
-
----
-
-## TURN Credential Generation (iOS)
-
-coturn uses time-limited HMAC credentials. Generate on the client:
+Generates time-limited HMAC-SHA1 credentials for coturn:
 
 ```swift
 import CryptoKit
@@ -673,29 +404,43 @@ func generateTURNCredentials(secret: String) -> (username: String, credential: S
     let expiry = Int(Date().timeIntervalSince1970) + 3600  // 1 hour
     let username = "\(expiry):visual911user"
     let key = SymmetricKey(data: Data(secret.utf8))
-    // SHA1 lives under CryptoKit.Insecure — HMAC<SHA1> does not compile
-    let mac = Insecure.HMAC<Insecure.SHA1>.authenticationCode(for: Data(username.utf8), using: key)
+    let mac = HMAC<Insecure.SHA1>.authenticationCode(for: Data(username.utf8), using: key)
     let credential = Data(mac).base64EncodedString()
     return (username, credential)
 }
+
+// Convenience accessors used by WebRTCManager
+func generatedTURNUsername() -> String { ... }
+func generatedTURNCredential() -> String { ... }
 ```
 
-In practice for the hackathon, hardcode a valid credential pair generated once at build time. For production, the server would vend credentials via an API call before the call starts.
+For the hackathon, the coturn shared secret is hardcoded in this file. For production, credentials would be fetched from the server's `/api/turn-credentials` endpoint.
+
+---
+
+## Info.plist (via project.yml)
+
+```yaml
+NSCameraUsageDescription: "Visual911 needs camera access to measure your vitals and stream video to the dispatcher."
+NSMicrophoneUsageDescription: "Visual911 needs microphone access so the dispatcher can hear you during the emergency call."
+NSLocationWhenInUseUsageDescription: "Visual911 sends your location to the dispatcher so emergency services can find you."
+NSLocalNetworkUsageDescription: "Visual911 connects to the dispatch server on your local network."
+NSAppTransportSecurity:
+  NSAllowsLocalNetworking: true
+```
 
 ---
 
 ## Build Checklist
 
 - [ ] Physical iOS device connected (not simulator)
-- [ ] Presage API key set in `Config.swift`
-- [ ] Server URL set in `Config.swift` (`wss://`, not `ws://`)
-- [ ] Bundle identifier set in Signing & Capabilities
-- [ ] Paid Apple developer account (required for WebRTC entitlements)
-- [ ] `NSCameraUsageDescription`, `NSMicrophoneUsageDescription`, `NSLocationWhenInUseUsageDescription` in Info.plist
+- [ ] `Secrets.swift` created from `Secrets.swift.example` with real Presage API key
+- [ ] Server URL in `Config.swift` points to deployed server (`wss://`)
+- [ ] TURN secret in `TURNCredentials.swift` matches coturn config
+- [ ] Run `xcodegen generate` from `ios/` directory to regenerate Xcode project
 - [ ] Both SPM packages resolved (SmartSpectra, stasel/WebRTC)
-- [ ] `CallManager` declared as `SignalingClientDelegate` and `WebRTCManagerDelegate` (see extensions at bottom of `CallManager.swift`)
-- [ ] TURN credentials use `Insecure.HMAC<Insecure.SHA1>` (not `HMAC<SHA1>`)
-- [ ] `captureAndSendFrame()` implemented in `AudioTap.swift` before demo
+- [ ] iOS deployment target ≥ 17.0
+- [ ] Paid Apple developer account for signing
 - [ ] Test Presage alone first (confirm HR readings before integrating WebRTC)
 - [ ] Test WebRTC alone second (confirm video reaches browser before adding audio tap)
 - [ ] Test full pipeline last

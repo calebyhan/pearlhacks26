@@ -19,12 +19,13 @@ Visual911 has three main components: an iOS caller app, a Python backend on Vult
                     ┌─────────▼─────────┐
                     │   Vultr Server     │
                     │   (server.py)      │
-                    │                   │
-                    │  /ws/signal       │──► forwards SDP/ICE
-                    │  /ws/audio   ─────┼──► Gemini Live API
-                    │  /ws/vitals       │
-                    │  /ws/dashboard ───┼──► Dispatcher Browser
-                    └───────────────────┘
+                    │                    │
+                    │  /ws/signal        │──► forwards SDP/ICE
+                    │  /ws/audio    ─────┼──► Gemini (batch)
+                    │  /ws/vitals        │
+                    │  /ws/dashboard ────┼──► Dispatcher Browser
+                    │  /api/turn-creds   │──► TURN credentials
+                    └────────────────────┘
 ```
 
 ---
@@ -33,39 +34,44 @@ Visual911 has three main components: an iOS caller app, a Python backend on Vult
 
 ### iOS App (Swift)
 
-The caller-facing application. Manages the full call lifecycle and coordinates three hardware resources:
+The caller-facing application. Manages the full call lifecycle and coordinates three hardware resources. Built with XcodeGen (`project.yml`).
 
-**Presage SmartSpectra SDK** reads contactless vitals (heart rate, breathing rate, HRV) from the front camera using rPPG. Runs for 15 seconds when SOS is pressed to establish a baseline, then stops so the camera can be used for WebRTC. Results are shown as "last measured" on the dispatcher dashboard.
+**Presage SmartSpectra SDK** reads contactless vitals (heart rate, breathing rate) from the front camera using rPPG. Runs for up to 15 seconds when SOS is pressed, but can finish early once signals stabilize (minimum 5s, requires 2s error cooldown). Real-time SDK status codes (face not found, too dark, etc.) drive scan feedback UI. Results are shown as "last measured" on the dispatcher dashboard.
 
-**RTCCameraVideoCapturer** (stasel/WebRTC) runs after Presage completes its scan. Captures front camera video and streams it P2P to the dispatcher's browser via WebRTC. Audio is included in the WebRTC stream for the dispatcher to hear ambient sounds.
+**RTCCameraVideoCapturer** (stasel/WebRTC) runs after Presage completes its scan. Captures front camera video at ~720p and streams it P2P to the dispatcher's browser via WebRTC. Audio is included in the WebRTC stream. A `FrameGrabber` (custom `RTCVideoRenderer`) retains the latest `CVPixelBuffer` for JPEG snapshot extraction.
 
-**AVAudioEngine tap** runs in parallel with WebRTC audio using `mixWithOthers` session mode. Captures a separate 16kHz mono PCM stream and sends it over a secondary WebSocket to the server, which forwards it to Gemini. This parallel stream is what Gemini analyzes — the dispatcher still hears audio directly via WebRTC.
+**AVAudioEngine tap** runs in parallel with WebRTC audio using `mixWithOthers` session mode. Captures a separate 16kHz mono PCM stream and sends it over a secondary WebSocket to the server, which buffers it for Gemini. Also sends JPEG frames every 2 seconds (captured via `FrameGrabber` from the WebRTC video track).
 
-**CLLocationManager** provides a one-shot GPS coordinate sent with the `call_initiated` message and periodically refreshed during the call.
+**CLLocationManager** provides a one-shot GPS coordinate sent with the `call_initiated` message.
 
 ### Vultr Server (Python asyncio)
 
-A single `server.py` process handles all backend logic. Uses `aiohttp` for WebSocket serving and asyncio tasks for concurrent call management.
+A single `server.py` process handles all backend logic. Uses `aiohttp` for WebSocket serving, `python-dotenv` for environment config, and asyncio tasks for concurrent call management.
 
 Four WebSocket endpoints:
 - `/ws/signal` — forwards WebRTC SDP offers, answers, and ICE candidates between caller and dispatcher
-- `/ws/audio` — receives PCM audio and JPEG frames from iOS, forwards to Gemini Live API
-- `/ws/vitals` — receives vitals JSON from iOS, forwards to the connected dispatcher dashboard
-- `/ws/dashboard` — browser-facing endpoint; pushes incoming call notifications, triage updates, vitals, and critical flags
+- `/ws/audio` — receives PCM audio and JPEG frames from iOS, buffers them for Gemini batch analysis
+- `/ws/vitals` — receives vitals JSON from iOS, forwards to the connected dispatcher dashboard; buffers vitals that arrive before `call_initiated` registers the call
+- `/ws/dashboard` — browser-facing endpoint; pushes incoming call notifications, triage updates, vitals, and call events; replays cached vitals on dispatcher join
 
-One asyncio task per active call manages the Gemini Live API session: consuming audio/frame input and emitting parsed triage JSON to `/ws/dashboard`.
+One REST endpoint:
+- `/api/turn-credentials` — generates time-limited HMAC TURN credentials for WebRTC NAT traversal
+
+One asyncio task per active call runs **batch Gemini analysis**: every 10 seconds, it drains the audio queue, wraps accumulated PCM in a WAV container, and calls `gemini-2.5-flash` via `generateContent` (not the Live API). Previous analysis summary is carried forward as context for continuity.
 
 A separate `coturn` process (port 3478/5349) provides STUN/TURN for WebRTC NAT traversal.
 
 ### Dispatcher Dashboard (Browser)
 
-A single `index.html` served from `/static` on Vultr. Uses the browser WebRTC API for the P2P video connection and a WebSocket to `/ws/dashboard` for all other data.
+A single `index.html` served at `/` on Vultr. Uses the browser WebRTC API for the P2P video connection and a WebSocket to `/ws/dashboard` for all other data. No framework — plain HTML, CSS, and JavaScript.
 
-Four panels:
-- **Video** — `<video>` element fed by the WebRTC P2P stream
-- **Vitals** — Chart.js rolling graph of HR and breathing rate, with confidence indicator
-- **Gemini Triage** — live situation summary, severity level (1–5), emotional state, recommended response type, critical flag alerts
-- **Location** — Leaflet.js map with GPS pin
+Three-column, two-row grid layout:
+- **Video** (left, full height) — `<video>` element fed by the WebRTC P2P stream, mirrored, with overlay mute/end controls
+- **Vitals** (top center) — HR and breathing rate with confidence bars; labeled "From pre-call scan"
+- **AI Triage** (top right) — situation summary, severity level (1–5), emotional state, recommended response type, keywords
+- **Location** (bottom, spans center + right) — Leaflet.js map with GPS pin
+
+TURN credentials are fetched dynamically from `/api/turn-credentials` on page load. Connection status indicator in the header shows WebSocket state.
 
 ---
 
@@ -75,45 +81,49 @@ Four panels:
 
 ```
 1. User presses SOS
-2. Presage starts scanning (15s, camera exclusive)
-3. After scan: Presage stops, results cached locally
+2. Presage starts scanning (up to 15s, can finish early when signals stabilize)
+3. Real-time SDK feedback shown (face position, lighting quality, signal stability)
+4. After scan: Presage stops, results cached locally
 
-4. iOS opens:
-   - /ws/signal?call_id=<uuid>
+5. iOS opens:
+   - /ws/signal?call_id=<uuid>&role=caller
    - /ws/audio?call_id=<uuid>
    - /ws/vitals?call_id=<uuid>
 
-5. iOS sends: { type: "call_initiated", call_id, location }
+6. iOS sends: { type: "call_initiated", call_id, location }
+   (vitals sent 0.3s later to ensure call is registered server-side first)
 
-6. Server:
-   - Stores call state
-   - Starts Gemini Live API session (asyncio task)
+7. Server:
+   - Stores call state (including audio_queue)
+   - Replays any vitals buffered before call registration
    - Notifies all connected dispatcher dashboards: { type: "incoming_call", call_id, location }
 
-7. Dispatcher clicks Answer → sends { type: "dispatcher_joined", call_id }
+8. Dispatcher clicks Answer → sends { type: "dispatcher_joined", call_id }
 
-8. Server records dispatcher WebSocket, sends { type: "dispatcher_ready" } to iOS
+9. Server:
+   - Records dispatcher WebSocket
+   - Starts Gemini analysis task (not at call_initiated — saves RPD quota)
+   - Replays cached vitals to dispatcher
+   - Sends { type: "dispatcher_ready" } to iOS
 
-9. WebRTC handshake begins (iOS creates offer, signals through /ws/signal)
+10. WebRTC handshake begins (iOS creates offer, signals through /ws/signal)
 
-10. P2P video/audio connection established
+11. P2P video/audio connection established
 ```
 
 ### Active Call
 
 ```
-Every ~2s (vitals):
-iOS → /ws/vitals → server → /ws/dashboard → dispatcher vitals panel
-
 Continuously (audio):
-iOS AVAudioEngine → PCM chunks → /ws/audio → server → Gemini Live API
+iOS AVAudioEngine → PCM chunks → /ws/audio → server audio_queue
 
 Every 2s (frames):
-iOS → JPEG snapshot → /ws/audio (same connection) → server → Gemini realtime_input.video
+iOS → JPEG snapshot (from FrameGrabber) → /ws/audio (JSON) → server audio_queue
 
-Gemini output (on change):
+Every 10s (Gemini batch analysis):
+Server drains audio_queue → wraps PCM in WAV → generateContent(gemini-2.5-flash)
+  + latest JPEG frame + previous analysis context
 Gemini → triage JSON → server parses → /ws/dashboard { type: "triage_update" }
-Gemini tool call → { type: "critical_flag" } → /ws/dashboard (plays alert sound)
 
 Video/audio (P2P, server not involved):
 iOS RTCCameraVideoCapturer → WebRTC → dispatcher <video> element
@@ -124,13 +134,17 @@ iOS RTCCameraVideoCapturer → WebRTC → dispatcher <video> element
 ```
 Either party sends { type: "call_ended", call_id }
 Server:
-  - Cancels Gemini asyncio task
+  - Sends sentinel to audio_queue, cancels Gemini task
   - Notifies other party
   - Removes call from active_calls dict
 iOS:
   - Closes all 3 WebSockets
   - Stops RTCCameraVideoCapturer
+  - Thread-safe cleanup with re-entrancy guard
   - Returns to IDLE state
+Dashboard:
+  - Tears down WebRTC peer connection
+  - Resets vitals, triage, map marker, and UI controls
 ```
 
 ---
@@ -141,20 +155,25 @@ iOS:
 IDLE
   │ SOS pressed
   ▼
-SCANNING  ← Presage running, camera exclusive, 15s
-  │ scan complete
+SCANNING  ← Presage running, camera exclusive, up to 15s
+  │         real-time SDK feedback (face position, lighting)
+  │         can finish early when HR + BR signals stabilize
+  │         user can retry scan
+  │ scan complete (stable signals or timeout)
   ▼
-INITIATING  ← open 3 WebSockets, Gemini session starts server-side
+INITIATING  ← open 3 WebSockets, send call_initiated + vitals
   │ dispatcher answers (dispatcher_ready received)
   ▼
 CONNECTING  ← WebRTC offer/answer/ICE exchange via /ws/signal
-  │ P2P established
+  │ P2P established (ICE connected/completed)
   ▼
 ACTIVE  ← video, audio, vitals, Gemini all live
-  │ end call (either party) or connection drop
+  │         resends cached vitals on ICE connect
+  │         ICE disconnected = transient (no teardown)
+  │ end call (either party) or ICE failed
   ▼
-CLEANUP  ← close WebSockets, stop capturer, notify server
-  │
+CLEANUP  ← thread-safe, re-entrant-safe teardown
+  │         close WebSockets, stop capturer, nil references
   ▼
 IDLE
 ```
@@ -177,11 +196,14 @@ IDLE
 **Why a single Python process instead of Node.js + Python?**
 Fewer moving parts for a hackathon. aiohttp handles WebSockets fine. No IPC needed between services.
 
-**Why audio-only Gemini session (not video+audio)?**
-Free tier video+audio sessions cap at 2 minutes. Audio-only sessions last 15 minutes. We work around the lack of a persistent video stream by injecting JPEG frames every 2 seconds via `realtime_input.video` — Gemini processes video at 1 FPS anyway, so this is equivalent.
+**Why batch `generateContent` instead of Gemini Live API?**
+The Live API (audio-only mode) has a 15-minute session limit, and the native audio preview model had reliability issues. Batch analysis every 10 seconds using `gemini-2.5-flash` with WAV audio + JPEG frames is more reliable, simpler to debug, and carries forward previous analysis context for continuity. Trade-off: ~10s latency on triage updates instead of real-time streaming.
 
 **Why time-slice Presage and WebRTC instead of running them concurrently?**
-Both need exclusive access to `AVCaptureSession` on the front camera. Two sessions on the same camera cause a hard crash. The 15-second pre-call scan gives dispatchers biometric context the moment the call connects, which is actually a better UX story than trying to show live vitals mid-call.
+Both need exclusive access to `AVCaptureSession` on the front camera. Two sessions on the same camera cause a hard crash (-12785). The pre-call scan gives dispatchers biometric context the moment the call connects, which is actually a better UX story than trying to show live vitals mid-call.
 
 **Why route vitals through the server instead of RTCDataChannel?**
-DataChannel is P2P — the server never sees it. Routing through `/ws/vitals` lets the server inject vitals context into Gemini ("caller HR just spiked to 142 bpm") and keeps the dashboard on a single data pipeline (`/ws/dashboard`) instead of two separate channels.
+DataChannel is P2P — the server never sees it. Routing through `/ws/vitals` lets the server cache vitals and replay them when the dispatcher joins, and keeps the dashboard on a single data pipeline (`/ws/dashboard`) instead of two separate channels.
+
+**Why dynamic TURN credentials via `/api/turn-credentials`?**
+coturn uses time-limited HMAC credentials. The server generates them on demand so both the iOS app and dashboard can fetch fresh credentials without hardcoding secrets in client code.

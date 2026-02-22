@@ -8,547 +8,179 @@ It connects to two things:
 1. The Vultr server via `/ws/dashboard` WebSocket (receives triage updates, vitals, call events)
 2. The iOS caller app via WebRTC P2P (receives live video and audio directly)
 
+External dependencies: Leaflet.js for maps. No Chart.js — vitals are displayed as numeric values with confidence bars.
+
 ---
 
 ## Layout
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  🔴 INCOMING CALL  [ANSWER]          Visual911 Dispatcher       │
+│  ● Connected        VISUAL911                                    │
 ├────────────────────┬─────────────────┬──────────────────────────┤
 │                    │   VITALS         │   AI TRIAGE              │
-│   VIDEO FEED       │  ❤ HR: 127 bpm  │  Severity: ████░ 4/5    │
-│                    │  ↕ BR: 22/min   │  Medical emergency       │
-│   (live WebRTC)    │  Conf: ███░ 91% │  Caller: Panicked        │
-│                    │                 │  Cannot speak: yes       │
-│                    │  [HR graph]     │  ⚠ CRITICAL FLAG        │
-├────────────────────┴─────────────────┴──────────────────────────┤
-│  📍 MAP — GPS pin at caller location (Leaflet.js)                │
-│                                                                  │
-│  [END CALL]                                                      │
-└──────────────────────────────────────────────────────────────────┘
+│   VIDEO FEED       │  Heart Rate      │  Severity: ████░ 4/5    │
+│                    │  127 bpm [conf]  │  Medical emergency       │
+│   (live WebRTC)    │                 │  Caller: Panicked        │
+│   [🔇] [END]      │  Breathing Rate  │  Can speak: No           │
+│   (overlay ctrls)  │  22 /min [conf] │  Keywords: chest, pain   │
+│                    │                 │  Response: Medical        │
+├────────────────────┼─────────────────┴──────────────────────────┤
+│                    │   📍 MAP — GPS pin (Leaflet.js)              │
+│   (video cont.)   │                                              │
+└────────────────────┴─────────────────────────────────────────────┘
 ```
+
+Key layout details:
+- 3-column, 2-row CSS grid
+- Video panel spans the entire left column (both rows)
+- Vitals: top-center panel
+- Triage: top-right panel
+- Map: bottom row, spans center + right columns
+- All panels have `border-radius: 22px` and `box-shadow`
+- Video is mirrored (`transform: scaleX(-1)`) since front camera is used
 
 ---
 
-## index.html
+## Key Implementation Details
+
+### HTML Structure
 
 ```html
-<!DOCTYPE html>
-<html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/static/logo.svg">
   <title>Visual911 — Dispatcher</title>
-
-  <!-- Chart.js for vitals graph -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
-  <!-- Leaflet.js for map -->
+  <!-- Leaflet.js for map (no Chart.js) -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #0a0a0f; color: #e0e0e0; font-family: 'SF Pro', system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; }
-
-    #header {
-      padding: 12px 20px;
-      background: #111118;
-      border-bottom: 1px solid #222;
-      display: flex;
-      align-items: center;
-      gap: 16px;
-    }
-    #header h1 { font-size: 16px; font-weight: 600; color: #fff; margin-left: auto; }
-
-    #incoming-banner {
-      display: none;
-      background: #1a0000;
-      border: 1px solid #ff3333;
-      border-radius: 8px;
-      padding: 10px 16px;
-      align-items: center;
-      gap: 12px;
-    }
-    #incoming-banner.visible { display: flex; }
-    #incoming-banner .pulse { width: 10px; height: 10px; border-radius: 50%; background: #ff3333; animation: pulse 1s infinite; }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-    #answer-btn {
-      background: #00cc44;
-      color: white;
-      border: none;
-      border-radius: 6px;
-      padding: 8px 20px;
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-    }
-
-    #main-grid {
-      flex: 1;
-      display: grid;
-      grid-template-columns: 1fr 280px 320px;
-      grid-template-rows: 1fr 200px;
-      gap: 1px;
-      background: #222;
-      overflow: hidden;
-    }
-
-    .panel {
-      background: #0f0f18;
-      padding: 16px;
-      overflow: hidden;
-    }
-    .panel-title { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #666; margin-bottom: 12px; }
-
-    /* Video panel */
-    #video-panel { grid-row: 1; position: relative; }
-    #remote-video { width: 100%; height: 100%; object-fit: cover; background: #000; border-radius: 4px; cursor: pointer; }
-    #unmute-hint {
-      position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
-      background: rgba(0,0,0,0.7); color: #aaa; font-size: 11px;
-      padding: 4px 10px; border-radius: 4px; pointer-events: none;
-    }
-
-    /* Vitals panel */
-    #vitals-panel { grid-row: 1; }
-    .vital-row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
-    .vital-label { font-size: 12px; color: #888; }
-    .vital-value { font-size: 28px; font-weight: 700; color: #fff; }
-    .vital-unit { font-size: 12px; color: #666; margin-left: 4px; }
-    .confidence-bar { height: 4px; background: #222; border-radius: 2px; margin-bottom: 16px; }
-    .confidence-fill { height: 100%; border-radius: 2px; background: #00cc44; transition: width 0.5s; }
-    #signal-lost { display: none; color: #ff6600; font-size: 12px; text-align: center; padding: 8px; background: #1a0f00; border-radius: 4px; }
-    #hr-chart-container { height: 100px; }
-
-    /* Triage panel */
-    #triage-panel { grid-row: 1; }
-    .severity-bar { display: flex; gap: 4px; margin-bottom: 12px; }
-    .severity-dot { flex: 1; height: 8px; border-radius: 2px; background: #222; }
-    .severity-dot.active { background: #ff3333; }
-    .severity-dot.active.low { background: #00cc44; }
-    .severity-dot.active.mid { background: #ffaa00; }
-    .triage-field { margin-bottom: 10px; }
-    .triage-field-label { font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: 0.06em; }
-    .triage-field-value { font-size: 13px; color: #ddd; margin-top: 2px; }
-    #critical-alert {
-      display: none;
-      background: #ff0000;
-      color: white;
-      font-weight: 700;
-      font-size: 14px;
-      text-align: center;
-      padding: 10px;
-      border-radius: 6px;
-      margin-bottom: 12px;
-      animation: flashred 0.5s infinite;
-    }
-    @keyframes flashred { 0%, 100% { background: #ff0000; } 50% { background: #880000; } }
-
-    /* Map panel */
-    #map-panel { grid-column: 1 / -1; grid-row: 2; }
-    #map { width: 100%; height: 100%; }
-
-    /* End call */
-    #end-call-btn {
-      position: fixed;
-      bottom: 216px;
-      right: 20px;
-      background: #cc0000;
-      color: white;
-      border: none;
-      border-radius: 8px;
-      padding: 10px 24px;
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-      display: none;
-    }
-    #end-call-btn.visible { display: block; }
-
-    body.critical-state { animation: criticalFlash 1s infinite; }
-    @keyframes criticalFlash { 0%, 100% { border: 3px solid transparent; } 50% { border: 3px solid #ff0000; } }
-  </style>
 </head>
-<body>
+```
 
+```html
 <div id="header">
-  <div id="incoming-banner">
-    <div class="pulse"></div>
-    <span>Incoming call</span>
-    <span id="incoming-location" style="color:#888;font-size:12px;"></span>
-    <button id="answer-btn">ANSWER</button>
-  </div>
-  <h1>Visual911 — Dispatcher</h1>
+  <span id="conn-status" class="status-dot disconnected"></span>
+  <div id="incoming-banner"><!-- pulse dot + ANSWER button --></div>
+  <h1>VISUAL911</h1>
 </div>
-
-<div id="critical-alert" style="display:none;margin:8px 20px;border-radius:6px;text-align:center;padding:10px;font-weight:700;background:#ff0000;color:#fff;"></div>
 
 <div id="main-grid">
   <div class="panel" id="video-panel">
-    <div class="panel-title">Live Feed</div>
-    <video id="remote-video" autoplay playsinline muted></video>
-    <div id="unmute-hint">🔇 Click video to unmute</div>
-  </div>
-
-  <div class="panel" id="vitals-panel">
-    <div class="panel-title">Vitals</div>
-
-    <div id="signal-lost">⚠ Signal lost / low confidence</div>
-
-    <div class="vital-row">
-      <span class="vital-label">❤ Heart Rate</span>
-    </div>
-    <div>
-      <span class="vital-value" id="hr-value">--</span>
-      <span class="vital-unit">bpm</span>
-    </div>
-    <div class="confidence-bar"><div class="confidence-fill" id="hr-conf" style="width:0%"></div></div>
-
-    <div class="vital-row">
-      <span class="vital-label">↕ Breathing Rate</span>
-    </div>
-    <div>
-      <span class="vital-value" id="br-value">--</span>
-      <span class="vital-unit">/min</span>
-    </div>
-    <div class="confidence-bar"><div class="confidence-fill" id="br-conf" style="width:0%"></div></div>
-
-    <div style="font-size:10px;color:#555;margin-bottom:8px;">From 15s pre-call scan</div>
-
-    <div id="hr-chart-container">
-      <canvas id="hr-chart"></canvas>
+    <!-- grid-row: 1 / 3 (spans both rows) -->
+    <video id="remote-video" autoplay playsinline muted
+           style="transform: scaleX(-1);"></video>
+    <div id="video-controls">
+      <button id="mute-btn"><!-- SVG mic icon --></button>
+      <button id="end-call-btn">End Call</button>
     </div>
   </div>
 
-  <div class="panel" id="triage-panel">
-    <div class="panel-title">AI Triage</div>
-
-    <div class="severity-bar">
-      <div class="severity-dot" id="sev1"></div>
-      <div class="severity-dot" id="sev2"></div>
-      <div class="severity-dot" id="sev3"></div>
-      <div class="severity-dot" id="sev4"></div>
-      <div class="severity-dot" id="sev5"></div>
-    </div>
-    <div style="font-size:11px;color:#666;margin-bottom:12px;">Severity: <span id="severity-label">--</span>/5</div>
-
-    <div class="triage-field">
-      <div class="triage-field-label">Situation</div>
-      <div class="triage-field-value" id="situation">Waiting for analysis...</div>
-    </div>
-    <div class="triage-field">
-      <div class="triage-field-label">Caller State</div>
-      <div class="triage-field-value" id="emotional-state">--</div>
-    </div>
-    <div class="triage-field">
-      <div class="triage-field-label">Response Type</div>
-      <div class="triage-field-value" id="response-type">--</div>
-    </div>
-    <div class="triage-field">
-      <div class="triage-field-label">Can Speak</div>
-      <div class="triage-field-value" id="can-speak">--</div>
-    </div>
-    <div class="triage-field">
-      <div class="triage-field-label">Keywords</div>
-      <div class="triage-field-value" id="keywords">--</div>
-    </div>
-  </div>
-
+  <div class="panel" id="vitals-panel"><!-- top center --></div>
+  <div class="panel" id="triage-panel"><!-- top right --></div>
   <div class="panel" id="map-panel">
+    <!-- grid-column: 2 / 4 (spans center + right) -->
     <div id="map"></div>
   </div>
 </div>
+```
 
-<button id="end-call-btn">END CALL</button>
+### CSS Grid
 
-<script>
-// ─── State ────────────────────────────────────────────────────────────────────
-let ws = null;
-let peerConnection = null;
-let currentCallId = null;
-let map = null;
-let mapMarker = null;
-
-// ─── Chart ───────────────────────────────────────────────────────────────────
-const hrCtx = document.getElementById('hr-chart').getContext('2d');
-const hrLabels = Array(30).fill('');
-const hrData = Array(30).fill(null);
-const hrChart = new Chart(hrCtx, {
-  type: 'line',
-  data: {
-    labels: hrLabels,
-    datasets: [{
-      data: hrData,
-      borderColor: '#ff4444',
-      backgroundColor: 'rgba(255,68,68,0.1)',
-      borderWidth: 2,
-      tension: 0.3,
-      pointRadius: 0,
-      fill: true,
-    }]
-  },
-  options: {
-    responsive: true,
-    maintainAspectRatio: false,
-    scales: { x: { display: false }, y: { min: 40, max: 200, display: false } },
-    plugins: { legend: { display: false } },
-    animation: { duration: 300 },
-  }
-});
-
-function pushHRSample(value) {
-  hrData.shift();
-  hrData.push(value);
-  hrChart.update();
+```css
+#main-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1.2fr 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 14px;
+  padding: 14px;
+  overflow: hidden;
 }
-
-// ─── Map ─────────────────────────────────────────────────────────────────────
-function initMap() {
-  map = L.map('map').setView([35.9, -79.05], 13);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '© OpenStreetMap'
-  }).addTo(map);
+.panel {
+  background: #12121a;
+  padding: 20px;
+  border-radius: 22px;
+  box-shadow: 0 2px 16px rgba(0,0,0,0.24);
 }
+#video-panel { grid-row: 1 / 3; }
+#map-panel   { grid-column: 2 / 4; }
+```
 
-function updateMapPin(lat, lng) {
-  if (!map) initMap();
-  const latlng = [lat, lng];
-  if (mapMarker) {
-    mapMarker.setLatLng(latlng);
-  } else {
-    mapMarker = L.marker(latlng).addTo(map).bindPopup('Caller location').openPopup();
-  }
-  map.setView(latlng, 15);
-}
+### Connection Status
 
-// ─── WebRTC ───────────────────────────────────────────────────────────────────
-const iceServers = [
-  { urls: 'stun:yourdomain.com:3478' },
-  {
-    urls: 'turn:yourdomain.com:3478',
-    username: 'TURN_USERNAME',      // Replace with generated credentials
-    credential: 'TURN_CREDENTIAL'
-  }
-];
+Green/red dot in the header showing WebSocket connection state:
 
-function createPeerConnection() {
-  peerConnection = new RTCPeerConnection({ iceServers });
+```javascript
+ws.onopen = () => {
+  connStatus.className = 'status-dot connected';  // green
+};
+ws.onclose = () => {
+  connStatus.className = 'status-dot disconnected'; // red
+  setTimeout(connectDashboard, 2000); // auto-reconnect
+};
+```
 
-  peerConnection.onicecandidate = (event) => {
-    if (event.candidate && ws) {
-      ws.send(JSON.stringify({
-        type: 'ice',
-        call_id: currentCallId,
-        candidate: event.candidate.candidate,
-        sdpMid: event.candidate.sdpMid,
-        sdpMLineIndex: event.candidate.sdpMLineIndex
-      }));
+### TURN Credentials (Dynamic)
+
+No hardcoded TURN credentials. Fetched from the server's REST endpoint:
+
+```javascript
+async function fetchTurnCredentials() {
+  const resp = await fetch('/api/turn-credentials');
+  const data = await resp.json();
+  return [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    {
+      urls: data.uris,
+      username: data.username,
+      credential: data.credential,
     }
-  };
-
-  peerConnection.ontrack = (event) => {
-    const video = document.getElementById('remote-video');
-    video.srcObject = event.streams[0];
-    // Video starts muted (browser autoplay policy). Click to unmute.
-    video.onclick = () => {
-      video.muted = !video.muted;
-      document.getElementById('unmute-hint').textContent =
-        video.muted ? '🔇 Click video to unmute' : '🔊 Click video to mute';
-    };
-  };
-
-  peerConnection.onconnectionstatechange = () => {
-    console.log('WebRTC state:', peerConnection.connectionState);
-  };
+  ];
 }
+```
 
+ICE servers include Google's public STUN servers plus the project's coturn TURN server with HMAC-SHA1 time-limited credentials.
+
+### WebSocket Protocol Auto-Detection
+
+```javascript
+const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+const wsUrl = `${protocol}//${window.location.host}/ws/dashboard`;
+```
+
+Automatically uses `wss:` in production and `ws:` for local development.
+
+### WebRTC Flow
+
+The dashboard acts as the WebRTC **answerer** (never the offerer). The iOS app always creates the offer. Signaling routes through `/ws/dashboard` ↔ server ↔ `/ws/signal`.
+
+```javascript
 async function handleOffer(offerData) {
-  createPeerConnection();
+  const iceServers = await fetchTurnCredentials();
+  peerConnection = new RTCPeerConnection({ iceServers });
+  // ... onicecandidate, ontrack handlers
   await peerConnection.setRemoteDescription({ type: 'offer', sdp: offerData.sdp });
   const answer = await peerConnection.createAnswer();
   await peerConnection.setLocalDescription(answer);
-  ws.send(JSON.stringify({
-    type: 'answer',
-    call_id: currentCallId,
-    sdp: answer.sdp
-  }));
+  ws.send(JSON.stringify({ type: 'answer', call_id: currentCallId, sdp: answer.sdp }));
 }
-
-// ─── Dashboard WebSocket ──────────────────────────────────────────────────────
-function connectDashboard() {
-  const wsUrl = `wss://${window.location.host}/ws/dashboard`;
-  ws = new WebSocket(wsUrl);
-
-  ws.onopen = () => console.log('Dashboard WS connected');
-
-  ws.onmessage = async (event) => {
-    const data = JSON.parse(event.data);
-
-    switch (data.type) {
-      case 'incoming_call':
-        onIncomingCall(data);
-        break;
-      case 'dispatcher_ready':
-        // Not expected on dashboard side, but harmless
-        break;
-      case 'triage_update':
-        onTriageUpdate(data.report);
-        break;
-      case 'critical_flag':
-        onCriticalFlag(data);
-        break;
-      case 'vitals':
-        onVitals(data);
-        break;
-      case 'call_ended':
-        onCallEnded(data);
-        break;
-      // WebRTC signaling
-      case 'offer':
-        currentCallId = data.call_id;
-        await handleOffer(data);
-        break;
-      case 'ice':
-        if (peerConnection) {
-          await peerConnection.addIceCandidate({
-            candidate: data.candidate,
-            sdpMid: data.sdpMid,
-            sdpMLineIndex: data.sdpMLineIndex
-          });
-        }
-        break;
-    }
-  };
-
-  ws.onclose = () => {
-    console.log('Dashboard WS closed, reconnecting in 2s...');
-    setTimeout(connectDashboard, 2000);
-  };
-}
-
-// ─── Event Handlers ───────────────────────────────────────────────────────────
-function onIncomingCall(data) {
-  currentCallId = data.call_id;
-  const banner = document.getElementById('incoming-banner');
-  banner.classList.add('visible');
-
-  const loc = data.location;
-  if (loc?.lat) {
-    document.getElementById('incoming-location').textContent =
-      `📍 ${loc.lat.toFixed(4)}, ${loc.lng.toFixed(4)}`;
-    updateMapPin(loc.lat, loc.lng);
-  }
-}
-
-document.getElementById('answer-btn').onclick = () => {
-  if (!currentCallId || !ws) return;
-  document.getElementById('incoming-banner').classList.remove('visible');
-  document.getElementById('end-call-btn').classList.add('visible');
-
-  ws.send(JSON.stringify({
-    type: 'dispatcher_joined',
-    call_id: currentCallId
-  }));
-};
-
-document.getElementById('end-call-btn').onclick = () => {
-  if (!ws || !currentCallId) return;
-  ws.send(JSON.stringify({ type: 'call_ended', call_id: currentCallId }));
-  onCallEnded({ reason: 'dispatcher_ended' });
-};
-
-function onVitals(data) {
-  const hrConf = data.hrConfidence ?? 0;
-  const brConf = data.breathingConfidence ?? 0;
-  const signalLost = document.getElementById('signal-lost');
-
-  // Show warning only if both readings are low-confidence
-  signalLost.style.display = (hrConf < 0.7 && brConf < 0.7) ? 'block' : 'none';
-
-  // Update each vital independently based on its own confidence
-  if (hrConf >= 0.7) {
-    document.getElementById('hr-value').textContent = Math.round(data.hr);
-    document.getElementById('hr-conf').style.width = `${Math.round(hrConf * 100)}%`;
-    pushHRSample(data.hr);
-  }
-  if (brConf >= 0.7) {
-    document.getElementById('br-value').textContent = Math.round(data.breathing);
-    document.getElementById('br-conf').style.width = `${Math.round(brConf * 100)}%`;
-  }
-}
-
-function onTriageUpdate(report) {
-  document.getElementById('situation').textContent = report.situation_summary ?? '--';
-  document.getElementById('emotional-state').textContent = report.caller_emotional_state ?? '--';
-  document.getElementById('response-type').textContent = report.recommended_response_type ?? '--';
-  document.getElementById('can-speak').textContent = report.can_speak ? 'Yes' : 'No';
-  document.getElementById('keywords').textContent = (report.detected_keywords ?? []).join(', ') || '--';
-  document.getElementById('severity-label').textContent = report.severity ?? '--';
-
-  // Update severity dots
-  for (let i = 1; i <= 5; i++) {
-    const dot = document.getElementById(`sev${i}`);
-    dot.className = 'severity-dot';
-    if (i <= (report.severity ?? 0)) {
-      dot.classList.add('active');
-      if (report.severity <= 2) dot.classList.add('low');
-      else if (report.severity <= 3) dot.classList.add('mid');
-    }
-  }
-
-  if ((report.severity ?? 0) >= 4) {
-    document.body.classList.add('critical-state');
-  } else {
-    document.body.classList.remove('critical-state');
-  }
-}
-
-function onCriticalFlag(data) {
-  const alert = document.getElementById('critical-alert');
-  alert.textContent = `⚠ CRITICAL: ${data.reason}`;
-  alert.style.display = 'block';
-  playAlert();
-  setTimeout(() => { alert.style.display = 'none'; }, 10000);
-}
-
-function onCallEnded(data) {
-  document.getElementById('end-call-btn').classList.remove('visible');
-  document.getElementById('incoming-banner').classList.remove('visible');
-  document.body.classList.remove('critical-state');
-  document.getElementById('critical-alert').style.display = 'none';
-  if (peerConnection) {
-    peerConnection.close();
-    peerConnection = null;
-  }
-  document.getElementById('remote-video').srcObject = null;
-  currentCallId = null;
-  document.getElementById('situation').textContent = 'Call ended';
-}
-
-function playAlert() {
-  // AudioContext beep — no external audio files needed
-  try {
-    const ctx = new AudioContext();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.frequency.value = 880;
-    gain.gain.setValueAtTime(0.3, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5);
-    osc.start();
-    osc.stop(ctx.currentTime + 0.5);
-  } catch (e) {}
-}
-
-// ─── Init ─────────────────────────────────────────────────────────────────────
-initMap();
-connectDashboard();
-</script>
-</body>
-</html>
 ```
+
+### Video Controls Overlay
+
+Mute and end-call buttons float over the video panel:
+
+```css
+#video-controls {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: none; /* shown during active call */
+}
+```
+
+Mute button toggles between mic-on and mic-off SVG icons. End-call button is red with white text.
 
 ---
 
@@ -556,56 +188,108 @@ connectDashboard();
 
 ### Vitals Panel
 
-- Displays HR and breathing rate from the pre-call Presage scan (sent once via `/ws/vitals` at call start)
-- Rolling 30-point Chart.js line graph for HR history
-- Confidence bars — filled with green when confidence > 0.7
-- Each vital updates independently based on its own confidence value
-- "Signal lost" warning displayed only if both `hrConfidence < 0.7` and `breathingConfidence < 0.7`
-- Labeled "From 15s pre-call scan" to set expectations
+- Displays HR and breathing rate from the pre-call Presage scan
+- **Always shows values regardless of confidence** — dispatchers need all data even if uncertain
+- Confidence bars: green when confidence ≥ 0.4, **orange** when < 0.4
+- "Signal lost / low confidence" warning only if **both** readings have confidence < 0.4
+- No Chart.js HR graph — just numeric display with confidence indicators
+- Labeled "Contactless vitals • 15s pre-call scan"
+
+```javascript
+function onVitals(data) {
+  const hrConf = data.hrConfidence ?? 0;
+  const brConf = data.breathingConfidence ?? 0;
+
+  // Always show values (dispatchers need all data)
+  document.getElementById('hr-value').textContent = Math.round(data.hr);
+  document.getElementById('br-value').textContent = Math.round(data.breathing);
+
+  // Confidence bars
+  document.getElementById('hr-conf').style.width = `${Math.round(hrConf * 100)}%`;
+  document.getElementById('hr-conf').style.background = hrConf >= 0.4 ? '#00cc44' : '#ff8800';
+
+  // Signal lost warning at threshold 0.4 (not 0.7)
+  signalLost.style.display = (hrConf < 0.4 && brConf < 0.4) ? 'block' : 'none';
+}
+```
 
 ### Triage Panel
 
-- Updates on every `triage_update` event from the server
+- Updates on every `triage_update` from the server (~every 10 seconds)
 - Severity dots (1–5) color-coded: green (1–2), yellow (3), red (4–5)
-- Full body red flash animation on severity ≥ 4
-- `can_speak: false` is the key signal for the "silent caller" use case
-
-### Critical Flag Alert
-
-- Appears as a flashing red banner when Gemini calls `flag_critical`
-- AudioContext beep (no external audio files needed)
-- Auto-dismisses after 10 seconds
-- Can fire multiple times per call
+- Full body red flash animation when severity ≥ 4
+- Displays: situation summary, emotional state, response type, can_speak, keywords
+- No separate `critical_flag` alert — severity communicated via the `severity` field
 
 ### Location Map
 
 - Leaflet.js on OpenStreetMap tiles (no API key needed)
-- Pin placed on `incoming_call` and updated periodically if location refreshes
+- Pin placed on `incoming_call` and updated if location changes
 - Zoom level 15 (street level) on pin placement
+- Map panel spans center + right columns in the bottom row
 
 ---
 
-## WebRTC in the Browser
+## Call Lifecycle in Dashboard
 
-The dashboard acts as the WebRTC answerer (never the offerer). The iOS app always creates the offer. The signaling exchange routes through the server's `/ws/signal` → `/ws/dashboard` path.
+### Incoming Call
+1. `incoming_call` message received via WS
+2. Red pulse banner appears with ANSWER button
+3. Map pin placed at caller GPS coordinates
+4. Connection status shows green dot
 
-The browser needs no special permissions for receiving-only WebRTC. The `<video>` element is set `muted` initially but the dispatcher can unmute to hear ambient audio from the caller.
+### Answer
+1. Dispatcher clicks ANSWER
+2. Sends `dispatcher_joined` to server
+3. Server starts Gemini analysis task, replays cached vitals
+4. iOS sends WebRTC offer → server → dashboard
+5. Dashboard creates answer, sends back
+6. Video appears, controls overlay shown
 
----
+### Active Call
+- Video: live P2P WebRTC stream (mirrored, starts muted, click to unmute)
+- Vitals: displayed from pre-call scan data
+- Triage: updates every ~10 seconds from Gemini batch analysis
+- Mute button: toggles dashboard mic icon (visual only — mute is local)
 
-## TURN Credential Replacement
-
-Before deploying, replace the placeholder TURN credentials in the JavaScript:
-
+### End Call
+`onCallEnded()` performs a full reset:
 ```javascript
-const iceServers = [
-  { urls: 'stun:yourdomain.com:3478' },
-  {
-    urls: 'turn:yourdomain.com:3478',
-    username: 'ACTUAL_USERNAME',    // ← replace
-    credential: 'ACTUAL_CREDENTIAL' // ← replace
-  }
-];
+function onCallEnded(data) {
+  // Close WebRTC
+  if (peerConnection) { peerConnection.close(); peerConnection = null; }
+  document.getElementById('remote-video').srcObject = null;
+
+  // Reset vitals
+  document.getElementById('hr-value').textContent = '--';
+  document.getElementById('br-value').textContent = '--';
+  document.getElementById('hr-conf').style.width = '0%';
+  document.getElementById('br-conf').style.width = '0%';
+
+  // Reset triage
+  document.getElementById('situation').textContent = 'Waiting for analysis...';
+  document.getElementById('severity-label').textContent = '--';
+  // ... reset all severity dots, emotional-state, etc.
+
+  // Reset map marker
+  if (mapMarker) { map.removeLayer(mapMarker); mapMarker = null; }
+
+  // Reset mute button to unmuted state
+  // Hide video controls, incoming banner
+  currentCallId = null;
+}
 ```
 
-For the hackathon, generate a credential pair once using the coturn HMAC method and hardcode it. Credentials expire (we set 1-hour TTL in coturn config) — regenerate if they stop working.
+---
+
+## Styling Notes
+
+- Dark theme: `#0a0a0f` body, `#12121a` panels
+- Font: `'SF Pro', system-ui, sans-serif`
+- Panel border-radius: `22px` with `box-shadow: 0 2px 16px rgba(0,0,0,0.24)`
+- Header: `#111118` background, bold "VISUAL911" title
+- Incoming call banner: red border on `#1a0000` background with pulse animation
+- Answer button: green `#00cc44`
+- End call button: red `#cc0000`
+- Severity dots colored dynamically (green/yellow/red)
+- Video mirrored for front-camera view: `transform: scaleX(-1)`

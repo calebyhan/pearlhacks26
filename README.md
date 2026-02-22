@@ -1,29 +1,46 @@
 # Visual911
 
-A hackathon project for Pearl Hacks. Visual911 is a FaceTime-style emergency call system that gives dispatchers live video, real-time contactless biometrics, and AI-generated triage — so callers who cannot speak can still communicate.
+A FaceTime-style emergency call system that gives dispatchers live video, real-time contactless biometrics, and AI-generated triage — so callers who cannot speak can still communicate.
 
 ---
 
-## What It Does
+## The Problem
 
-A caller taps SOS on their iPhone. The app:
-1. Runs a rapid **15-second vitals scan** using the Presage SmartSpectra SDK (contactless heart rate and breathing via front camera)
-2. Connects a **live WebRTC video call** to the dispatcher's browser
-3. Streams audio to **Gemini Live API** for real-time AI triage analysis
-4. Sends GPS coordinates and vitals to the **dispatcher dashboard**
+Millions of 911 calls come from people who can't speak: domestic violence victims hiding from an intruder, cardiac patients mid-event, people with throat injuries. Traditional 911 is audio-only — dispatchers hear silence and have no way to assess the situation.
 
-The dispatcher sees: live video, biometric readings, an AI-generated situation summary, severity score, and a location pin — all updating in real time.
+## What Visual911 Does
+
+A caller taps **SOS** on their iPhone. The app:
+
+1. Runs a **15-second contactless vitals scan** — heart rate and breathing rate measured from the front camera alone (Presage SmartSpectra SDK, no wearable needed)
+2. Opens a **live WebRTC video call** directly to the dispatcher's browser
+3. Streams call audio to **Gemini AI** for real-time triage analysis every 10 seconds
+4. Sends **GPS coordinates** and vitals to the dispatcher dashboard
+
+The dispatcher sees: live video, biometric readings, an AI-generated situation summary with severity score, and a location pin — all in one screen.
 
 ---
 
-## Sponsor Tracks
+## Architecture
 
-| Track | How We Hit It |
-|---|---|
-| Triad STEM Emergency Support | Core use case — contactless vitals during 911 calls |
-| Presage | SmartSpectra SDK for HR, breathing rate, HRV, stress |
-| Gemini API | Live audio analysis, affective dialogue, function calling |
-| Vultr | Cloud VPS for signaling server, Gemini relay, TURN server |
+```
+┌──────────────┐        WebRTC P2P         ┌──────────────────┐
+│   iPhone     │◄────── video/audio ──────►│  Dispatcher      │
+│   (caller)   │                           │  Browser         │
+└──────┬───────┘                           └────────┬─────────┘
+       │ WebSocket                                  │ WebSocket
+       │ (signal, audio, vitals)                    │ (dashboard)
+       ▼                                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    Vultr VPS (server.py)                     │
+│  WebSocket hub · Gemini batch analysis · TURN credentials    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+- **iOS → Server**: 3 WebSockets (signaling, audio PCM + JPEG frames, vitals JSON)
+- **Server → Gemini**: Batch `generateContent` every 10s with buffered WAV audio + latest video frame
+- **Server → Dashboard**: Triage updates, vitals relay, call lifecycle events
+- **iOS ↔ Dashboard**: Direct WebRTC peer-to-peer video/audio (TURN-assisted if needed)
 
 ---
 
@@ -31,11 +48,12 @@ The dispatcher sees: live video, biometric readings, an AI-generated situation s
 
 | Layer | Technology |
 |---|---|
-| iOS App | Swift, Presage SmartSpectra SDK, stasel/WebRTC, AVAudioEngine, CLLocationManager |
-| Backend | Python asyncio, aiohttp, google-genai |
+| iOS App | Swift/SwiftUI, Presage SmartSpectra SDK, stasel/WebRTC, AVAudioEngine, CoreLocation |
+| Backend | Python 3.11+, asyncio, aiohttp, google-genai, python-dotenv |
+| AI | Gemini 2.5 Flash (batch generateContent with cumulative context) |
 | Infrastructure | Vultr Ubuntu VPS, coturn TURN server, Let's Encrypt SSL |
-| Dispatcher UI | HTML/JS, WebRTC browser API, Chart.js, Leaflet.js |
-| AI | Gemini 2.5 Flash Native Audio (Live API) |
+| Dispatcher UI | Plain HTML/CSS/JS, Leaflet.js, WebRTC browser API |
+| Domain | visual911.mooo.com |
 
 ---
 
@@ -43,56 +61,47 @@ The dispatcher sees: live video, biometric readings, an AI-generated situation s
 
 ```
 /
-├── ios/                    # Swift iOS app (Xcode project)
+├── ios/                        # Swift iOS app (XcodeGen project)
+│   ├── project.yml             # XcodeGen spec → generates .xcodeproj
+│   ├── Config.swift            # Server URLs
+│   ├── Secrets.swift           # API keys (gitignored)
+│   ├── CallManager.swift       # Call lifecycle state machine
+│   ├── PresageManager.swift    # Presage SDK wrapper
+│   ├── WebRTCManager.swift     # WebRTC peer connection
+│   ├── SignalingClient.swift   # /ws/signal WebSocket
+│   ├── AudioTap.swift          # AVAudioEngine → /ws/audio
+│   ├── VitalsClient.swift      # /ws/vitals WebSocket
+│   ├── TURNCredentials.swift   # HMAC-SHA1 TURN credential generation
+│   └── Views/                  # SwiftUI views per call state
 ├── server/
-│   └── server.py           # Single Python asyncio backend
-├── dashboard/
-│   └── index.html          # Dispatcher browser UI
-└── deploy/
-    └── turnserver.conf     # coturn config template
+│   ├── server.py               # Single-file Python backend
+│   ├── requirements.txt        # Pinned dependencies
+│   └── static/index.html       # Dispatcher dashboard
+└── docs/                       # Detailed implementation docs
 ```
 
 ---
 
-## Quickstart
+## Getting Started
 
-### Prerequisites
-- Xcode 15+, physical iOS device (iOS 15+)
-- Python 3.11+
-- Vultr VPS (Ubuntu 24.04)
-- API keys: Presage, Gemini (Google AI Studio)
+See [CONTRIBUTING.md](CONTRIBUTING.md) for full setup instructions (iOS, server, dashboard).
 
-### Local Development
+Local version:
 
 ```bash
-# Backend
-pip install aiohttp google-genai
-python3 server/server.py
+# Virtual environment for server
+cd server
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 
-# iOS — open in Xcode, set API keys in Config.swift, run on device
+# Server
+echo 'GEMINI_API_KEY=your-key' > .env
+python server.py
+
+# iOS — open ios/ in Xcode, copy Secrets.swift.example → Secrets.swift, run on device
 ```
 
-### Production Deployment
+## License
 
-See [deployment.md](deployment.md) for full Vultr + coturn + SSL setup.
-
----
-
-## Docs
-
-- [architecture.md](architecture.md) — system overview and data flow
-- [ios.md](ios.md) — Swift app implementation guide
-- [server.md](server.md) — Python backend, WebSocket endpoints, Gemini integration
-- [dashboard.md](dashboard.md) — dispatcher UI implementation
-- [deployment.md](deployment.md) — Vultr VPS setup, coturn, SSL
-- [demo.md](demo.md) — demo script, credit budget, environment checklist
-
----
-
-## Credit Budget (Presage)
-
-300 total credits across 3 team members. 1 credit = 30s of continuous measurement.
-
-- Each demo call: ~6 credits (15s scan + 15s buffer per call)
-- Estimated capacity: ~40–50 demo/test calls
-- **Never run Presage in idle.** Start on SOS press, stop when call ends.
+[MIT](LICENSE)

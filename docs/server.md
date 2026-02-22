@@ -2,19 +2,24 @@
 
 ## Overview
 
-A single Python asyncio process (`server.py`) handles all backend logic: WebRTC signaling, Gemini Live API session management, vitals relay, and static file serving for the dispatcher dashboard. No separate Node.js process, no IPC.
+A single Python asyncio process (`server.py`) handles all backend logic: WebRTC signaling, Gemini batch analysis, vitals relay, TURN credential generation, and static file serving for the dispatcher dashboard. No separate Node.js process, no IPC.
 
-Uses `aiohttp` for WebSocket serving. One asyncio `Task` per active call manages the Gemini session.
+Uses `aiohttp` for WebSocket serving, `python-dotenv` for environment config. One asyncio `Task` per active call manages periodic Gemini analysis using the batch `generateContent` API (not the Live API).
 
 ---
 
 ## Dependencies
 
-```bash
-pip install aiohttp google-genai
+```
+aiohttp>=3.9.0
+google-genai>=0.4.0
+python-dotenv>=1.2.1
+pytest>=8.0.0
+pytest-aiohttp>=1.0.0
+pytest-asyncio>=0.23.0
 ```
 
-No other dependencies. Python 3.11+ required.
+Python 3.11+ required. Install via `pip install -r requirements.txt`.
 
 ---
 
@@ -22,57 +27,65 @@ No other dependencies. Python 3.11+ required.
 
 ```
 server/
-├── server.py       # Everything — single file for hackathon simplicity
-└── static/
-    └── index.html  # Dispatcher dashboard (served at /)
+├── server.py           # Everything — single file for hackathon simplicity
+├── requirements.txt    # Pinned dependencies
+├── pyproject.toml      # Project metadata
+├── static/
+│   └── index.html      # Dispatcher dashboard (served at /)
+└── tests/
+    ├── conftest.py
+    └── test_server.py  # Pytest suite for WebSocket handlers
 ```
 
 ---
 
 ## server.py
 
-Full implementation:
+### Imports and Setup
 
 ```python
-import asyncio
-import base64
-import json
-import logging
-import os
-import time
-import uuid
-from typing import Optional
+import asyncio, base64, io, json, logging, os, struct, time, uuid, wave
+from dotenv import load_dotenv
+load_dotenv()
 
 import aiohttp
 from aiohttp import web
 from google import genai
 from google.genai import types
+```
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+### State
 
-# ─── State ────────────────────────────────────────────────────────────────────
-
+```python
 active_calls: dict[str, dict] = {}
 # Structure per call_id:
 # {
 #   "caller_ws": WebSocketResponse,
 #   "dispatcher_ws": Optional[WebSocketResponse],
 #   "dashboard_ws": Optional[WebSocketResponse],
+#   "audio_queue": asyncio.Queue,
 #   "gemini_task": Optional[asyncio.Task],
 #   "location": {"lat": float, "lng": float},
 #   "started_at": float,
+#   "last_vitals": Optional[dict],
 # }
 
 dispatcher_connections: set[web.WebSocketResponse] = set()
 
-# ─── Gemini ───────────────────────────────────────────────────────────────────
+# Buffer vitals that arrive before call_initiated registers the call
+pending_vitals: dict[str, dict] = {}
+```
 
-GEMINI_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+### Gemini Configuration
 
-SYSTEM_PROMPT = """You are an AI emergency triage assistant monitoring a 911 call.
-Analyze audio for emergency indicators: keywords, emotional state, breathing patterns, background sounds.
-When your assessment changes, output ONLY a JSON object — no preamble, no markdown:
+```python
+GEMINI_MODEL = "gemini-2.5-flash"
+ANALYSIS_INTERVAL = 10  # seconds between Gemini calls
+AUDIO_SAMPLE_RATE = 16000
+AUDIO_BYTES_PER_SAMPLE = 2  # 16-bit PCM
+
+SYSTEM_PROMPT = """You are an AI emergency triage assistant analyzing a 911 call audio clip.
+Output ONLY a JSON object — no preamble, no markdown, no extra text:
 {
   "situation_summary": "one sentence description",
   "detected_keywords": ["list", "of", "keywords"],
@@ -82,375 +95,191 @@ When your assessment changes, output ONLY a JSON object — no preamble, no mark
   "can_speak": true
 }
 Severity: 1=minor, 2=moderate, 3=urgent, 4=serious, 5=life-threatening.
-Keep output under 100 tokens. Speed over verbosity. Output only on meaningful changes."""
+Keep output under 100 tokens. Speed over verbosity."""
+```
 
-GEMINI_CONFIG = {
-    "response_modalities": ["TEXT"],
-    "system_instruction": SYSTEM_PROMPT,
-    "tools": [
-        types.Tool(function_declarations=[
-            types.FunctionDeclaration(
-                name="flag_critical",
-                description="Immediately flag this call as life-threatening",
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "reason": types.Schema(type=types.Type.STRING),
-                        "severity": types.Schema(type=types.Type.INTEGER),
-                    }
-                ),
-                behavior=types.Behavior.NON_BLOCKING,
-            )
-        ])
-    ],
-}
+**Key change from original design:** Uses batch `generateContent` instead of the Gemini Live API. No `flag_critical` function tool — severity is communicated via the JSON output directly.
 
+### pcm_to_wav Helper
 
-async def gemini_session_task(call_id: str, audio_queue: asyncio.Queue, dashboard_ws_getter):
+Raw PCM bytes must be wrapped in a WAV container because `generateContent` does not accept `audio/pcm`:
+
+```python
+def pcm_to_wav(pcm_bytes: bytes, sample_rate=16000, channels=1, sample_width=2) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(sample_width)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
+```
+
+### Gemini Analysis Task
+
+```python
+async def gemini_session_task(call_id, audio_queue, dashboard_ws_getter):
     """
-    Asyncio task that manages one Gemini Live API session per call.
-    Consumes from audio_queue (PCM chunks and JPEG frames).
-    Emits parsed triage JSON to the dashboard WebSocket.
+    Periodically drains the audio queue, sends buffered PCM (as WAV) +
+    latest video frame to Gemini generateContent, and forwards triage JSON
+    to the dashboard.
     """
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    audio_buffer = bytearray()
+    latest_frame: str | None = None  # base64 JPEG
+    previous_summary: str = ""  # cumulative context across rounds
+    analysis_count = 0
 
-    try:
-        async with client.aio.live.connect(model=GEMINI_MODEL, config=GEMINI_CONFIG) as session:
-            logger.info(f"[{call_id}] Gemini session opened")
+    while True:
+        # Collect audio for ANALYSIS_INTERVAL seconds
+        # ... drain queue, accumulate audio_buffer, keep latest_frame ...
 
-            async def send_loop():
-                """Pull from queue, forward to Gemini."""
-                while True:
-                    item = await audio_queue.get()
-                    if item is None:  # Sentinel to stop
-                        break
-                    if item["type"] == "audio":
-                        await session.send(input={
-                            "realtime_input": {
-                                "audio": {
-                                    "data": base64.b64encode(item["data"]).decode(),
-                                    "mime_type": "audio/pcm;rate=16000"
-                                }
-                            }
-                        })
-                    elif item["type"] == "frame":
-                        await session.send(input={
-                            "realtime_input": {
-                                "video": {
-                                    "data": item["data"],  # Already base64
-                                    "mime_type": "image/jpeg"
-                                }
-                            }
-                        })
+        # Convert raw PCM to WAV
+        wav_bytes = pcm_to_wav(chunk)
 
-            async def receive_loop():
-                """Receive Gemini output, parse and forward to dashboard."""
-                text_buffer = ""
-                async for response in session.receive():
-                    if response.text:
-                        text_buffer += response.text
-                        # Try to parse complete JSON
-                        if "}" in text_buffer:
-                            try:
-                                report = json.loads(text_buffer.strip())
-                                text_buffer = ""
-                                dashboard_ws = dashboard_ws_getter(call_id)
-                                if dashboard_ws and not dashboard_ws.closed:
-                                    await dashboard_ws.send_json({
-                                        "type": "triage_update",
-                                        "call_id": call_id,
-                                        "report": report
-                                    })
-                            except json.JSONDecodeError:
-                                # Keep buffering if incomplete; reset if clearly malformed
-                                # (buffer over 2KB with a closing brace = Gemini sent junk)
-                                if len(text_buffer) > 2000:
-                                    logger.warning(f"[{call_id}] Discarding malformed Gemini buffer")
-                                    text_buffer = ""
+        # Build content parts
+        parts = [
+            types.Part(inline_data=types.Blob(data=wav_bytes, mime_type="audio/wav")),
+        ]
+        if latest_frame:
+            parts.append(types.Part(inline_data=types.Blob(
+                data=base64.b64decode(latest_frame), mime_type="image/jpeg")))
 
-                    # Handle tool calls
-                    if response.tool_call:
-                        for fc in response.tool_call.function_calls:
-                            if fc.name == "flag_critical":
-                                dashboard_ws = dashboard_ws_getter(call_id)
-                                if dashboard_ws and not dashboard_ws.closed:
-                                    await dashboard_ws.send_json({
-                                        "type": "critical_flag",
-                                        "call_id": call_id,
-                                        "reason": fc.args.get("reason", ""),
-                                        "severity": fc.args.get("severity", 5)
-                                    })
+        # Prompt with cumulative context
+        prompt = "Analyze this 911 call audio clip and output triage JSON."
+        if previous_summary:
+            prompt = f"Previous analysis: {previous_summary}\n\nNew audio segment (update #{analysis_count}). Update your triage. Output triage JSON."
 
-            await asyncio.gather(send_loop(), receive_loop())
+        parts.append(types.Part(text=prompt))
 
-    except asyncio.CancelledError:
-        logger.info(f"[{call_id}] Gemini session cancelled")
-    except Exception as e:
-        logger.error(f"[{call_id}] Gemini error: {e}")
+        response = await client.aio.models.generate_content(
+            model=GEMINI_MODEL, contents=parts,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT, temperature=0.1))
 
+        # Parse JSON from response, forward to dashboard
+        # Save situation_summary for next round's context
+```
 
-# ─── WebSocket Handlers ────────────────────────────────────────────────────────
+Error handling: on analysis failure, sends a triage_update with error info to the dashboard so it doesn't stay on "Waiting for analysis..." forever.
 
-async def handle_signal(request: web.Request) -> web.WebSocketResponse:
-    """
-    /ws/signal?call_id=X&role=caller|dispatcher
-    Forwards WebRTC SDP/ICE between caller and dispatcher.
-    Also handles call lifecycle messages (call_initiated, dispatcher_joined, call_ended).
-    """
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
+### WebSocket Handlers
 
-    call_id = request.query.get("call_id")
-    role = request.query.get("role", "caller")
+#### `/ws/signal` — Signaling
 
-    if not call_id:
-        await ws.close()
-        return ws
+```python
+async def handle_signal(request):
+    # Query params: call_id, role (caller|dispatcher)
+```
 
-    logger.info(f"[{call_id}] Signal connected: {role}")
+Handles call lifecycle and WebRTC SDP/ICE forwarding:
+- `call_initiated`: Creates the call entry in `active_calls` with audio_queue, notifies all connected dispatchers via `incoming_call`. Checks `pending_vitals` buffer and replays any early vitals.
+- `call_ended`: Triggers `cleanup_call()`.
+- Other messages (SDP offers/answers, ICE candidates): forwarded to the opposing party (caller↔dispatcher).
+- On WebSocket close: if caller disconnects, triggers cleanup.
 
-    async for msg in ws:
-        if msg.type != aiohttp.WSMsgType.TEXT:
-            continue
+Guard against duplicate `call_initiated` for the same `call_id`.
 
-        try:
-            data = json.loads(msg.data)
-        except json.JSONDecodeError:
-            continue
+#### `/ws/audio` — Audio + Frame Ingestion
 
-        msg_type = data.get("type")
+```python
+async def handle_audio(request):
+    # Query params: call_id
+```
 
-        if msg_type == "call_initiated":
-            # Guard against duplicate call_id (e.g. iOS reconnect bug)
-            if call_id in active_calls:
-                logger.warning(f"[{call_id}] Duplicate call_initiated, ignoring")
-                continue
+- **Binary messages**: raw PCM chunks → `audio_queue.put({"type": "audio", "data": msg.data})`
+- **Text messages**: JSON `{ "type": "frame", "data": "<base64 JPEG>" }` → `audio_queue.put({"type": "frame", "data": ...})`
 
-            # Caller opened the call — create queue now so audio WebSocket
-            # can start enqueuing immediately. Gemini starts when dispatcher joins.
-            audio_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
-            active_calls[call_id] = {
-                "caller_ws": ws,
-                "dispatcher_ws": None,
-                "dashboard_ws": None,
-                "audio_queue": audio_queue,
-                "gemini_task": None,
-                "location": data.get("location", {}),
-                "started_at": time.time(),
-            }
+If queue is full (maxsize=500), drops silently. Audio and frames are consumed by the Gemini analysis task.
 
-            # Notify all connected dispatchers
-            for dash_ws in dispatcher_connections.copy():
-                if not dash_ws.closed:
-                    await dash_ws.send_json({
-                        "type": "incoming_call",
-                        "call_id": call_id,
-                        "location": data.get("location", {})
-                    })
+#### `/ws/vitals` — Vitals Relay
 
-        elif msg_type == "call_ended":
-            await cleanup_call(call_id)
+```python
+async def handle_vitals(request):
+    # Query params: call_id
+```
 
-        else:
-            # WebRTC SDP/ICE — forward to the other party
-            call = active_calls.get(call_id)
-            if not call:
-                continue
-            if role == "caller":
-                target = call.get("dashboard_ws")
-            else:
-                target = call.get("caller_ws")
-            if target and not target.closed:
-                await target.send_str(msg.data)
+Receives vitals JSON from iOS. Two behaviors:
+1. **Call exists**: stores as `call["last_vitals"]`, forwards to dashboard WebSocket.
+2. **Call not yet registered** (vitals arrive before `call_initiated`): stores in `pending_vitals[call_id]` buffer. These are replayed when `call_initiated` fires.
 
-    # WebSocket closed — treat as call end if this was the caller
-    if role == "caller" and call_id in active_calls:
-        await cleanup_call(call_id)
+When dispatcher joins (`dispatcher_joined` message on dashboard WS), `last_vitals` is replayed so the dashboard immediately shows the most recent reading.
 
-    return ws
+#### `/ws/dashboard` — Dispatcher Dashboard
 
+```python
+async def handle_dashboard(request):
+```
 
-async def handle_audio(request: web.Request) -> web.WebSocketResponse:
-    """
-    /ws/audio?call_id=X
-    Receives binary PCM chunks and JSON frame messages from iOS.
-    Puts them into the call's Gemini audio_queue.
-    """
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
+Bidirectional WebSocket for the dispatcher browser:
+- `dispatcher_joined`: Registers the dashboard WS on the call, starts the Gemini analysis task, replays `last_vitals`, sends `dispatcher_ready` to caller.
+- `call_ended`: Triggers `cleanup_call()`.
+- Other messages (SDP/ICE): forwarded to caller.
+- On disconnect: removes from `dispatcher_connections` set.
 
-    call_id = request.query.get("call_id")
+### REST Endpoints
 
-    async for msg in ws:
-        call = active_calls.get(call_id)
-        if not call:
-            continue
+#### `GET /` — Dashboard Page
 
-        queue = call.get("audio_queue")
-        if not queue:
-            continue
+```python
+async def handle_index(request):
+    return web.FileResponse("./static/index.html")
+```
 
-        if msg.type == aiohttp.WSMsgType.BINARY:
-            await queue.put({"type": "audio", "data": msg.data})
+Serves the dashboard HTML directly at the root path.
 
-        elif msg.type == aiohttp.WSMsgType.TEXT:
-            try:
-                data = json.loads(msg.data)
-                if data.get("type") == "frame":
-                    await queue.put({"type": "frame", "data": data["data"]})
-            except json.JSONDecodeError:
-                pass
+#### `GET /api/turn-credentials` — Dynamic TURN Credentials
 
-    return ws
+```python
+async def handle_turn_credentials(request):
+```
 
+Generates time-limited TURN credentials using HMAC-SHA1:
+- Username = `{expiry_timestamp}:visual911` (24-hour TTL)
+- Password = base64-encoded HMAC-SHA1 of the username with `TURN_SECRET`
+- Returns JSON with `username`, `credential`, `ttl`, and `uris` array
 
-async def handle_vitals(request: web.Request) -> web.WebSocketResponse:
-    """
-    /ws/vitals?call_id=X
-    Receives vitals JSON from iOS. Forwards to dashboard.
-    Could also inject into Gemini context here.
-    """
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
+Requires `TURN_SECRET` environment variable matching the coturn `static-auth-secret`.
 
-    call_id = request.query.get("call_id")
+### Cleanup
 
-    async for msg in ws:
-        if msg.type != aiohttp.WSMsgType.TEXT:
-            continue
-
-        call = active_calls.get(call_id)
-        if not call:
-            continue
-
-        try:
-            vitals = json.loads(msg.data)
-        except json.JSONDecodeError:
-            continue
-
-        # Forward to dashboard
-        dashboard_ws = call.get("dashboard_ws")
-        if dashboard_ws and not dashboard_ws.closed:
-            await dashboard_ws.send_json({
-                "type": "vitals",
-                "call_id": call_id,
-                **vitals
-            })
-
-        # Optional: inject into Gemini as context
-        # queue = call.get("audio_queue")
-        # if queue and vitals.get("hrConfidence", 0) > 0.7:
-        #     context_text = f"[Vitals update: HR={vitals['hr']}bpm, breathing={vitals['breathing']}/min]"
-        #     # Would need a text injection mechanism in gemini_session_task
-
-    return ws
-
-
-async def handle_dashboard(request: web.Request) -> web.WebSocketResponse:
-    """
-    /ws/dashboard
-    Browser-facing endpoint for dispatcher dashboard.
-    Receives: dispatcher_joined, call_ended, WebRTC SDP/ICE
-    Sends: incoming_call, triage_update, critical_flag, vitals, call_ended
-    """
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-
-    dispatcher_connections.add(ws)
-    logger.info("Dashboard connected")
-
-    async for msg in ws:
-        if msg.type != aiohttp.WSMsgType.TEXT:
-            continue
-        try:
-            data = json.loads(msg.data)
-        except json.JSONDecodeError:
-            continue
-
-        call_id = data.get("call_id")
-        msg_type = data.get("type")
-
-        if msg_type == "dispatcher_joined":
-            call = active_calls.get(call_id)
-            if call:
-                call["dashboard_ws"] = ws
-
-                # Start Gemini session now — not at call_initiated — to avoid
-                # burning RPD quota while waiting for a dispatcher to answer.
-                if call["gemini_task"] is None:
-                    task = asyncio.create_task(
-                        gemini_session_task(
-                            call_id,
-                            call["audio_queue"],
-                            lambda cid: active_calls.get(cid, {}).get("dashboard_ws")
-                        )
-                    )
-                    call["gemini_task"] = task
-
-                caller_ws = call.get("caller_ws")
-                if caller_ws and not caller_ws.closed:
-                    await caller_ws.send_json({"type": "dispatcher_ready", "call_id": call_id})
-
-        elif msg_type == "call_ended":
-            await cleanup_call(call_id)
-
-        else:
-            # WebRTC SDP/ICE from dispatcher → forward to caller
-            call = active_calls.get(call_id)
-            if call:
-                caller_ws = call.get("caller_ws")
-                if caller_ws and not caller_ws.closed:
-                    await caller_ws.send_str(msg.data)
-
-    dispatcher_connections.discard(ws)
-    logger.info("Dashboard disconnected")
-    return ws
-
-
-# ─── Cleanup ──────────────────────────────────────────────────────────────────
-
+```python
 async def cleanup_call(call_id: str, reason: str = "ended"):
-    call = active_calls.pop(call_id, None)
-    if not call:
-        return
+```
 
-    logger.info(f"[{call_id}] Cleaning up: {reason}")
+1. Pops call from `active_calls`
+2. Cancels Gemini task (sends sentinel to queue, then `task.cancel()`)
+3. Notifies dashboard with `call_ended`
+4. Notifies caller with `call_ended`
+5. Cleans up `pending_vitals` for the call_id
 
-    # Stop Gemini
-    task = call.get("gemini_task")
-    if task and not task.done():
-        queue = call.get("audio_queue")
-        if queue:
-            await queue.put(None)  # Sentinel
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+### App Setup
 
-    # Notify dashboard
-    dashboard_ws = call.get("dashboard_ws")
-    if dashboard_ws and not dashboard_ws.closed:
-        await dashboard_ws.send_json({"type": "call_ended", "call_id": call_id, "reason": reason})
-
-    # Notify caller
-    caller_ws = call.get("caller_ws")
-    if caller_ws and not caller_ws.closed:
-        await caller_ws.send_json({"type": "call_ended", "call_id": call_id, "reason": reason})
-
-
-# ─── App Setup ────────────────────────────────────────────────────────────────
-
+```python
 def create_app() -> web.Application:
     app = web.Application()
+    app.router.add_get("/", handle_index)
+    app.router.add_get("/api/turn-credentials", handle_turn_credentials)
     app.router.add_get("/ws/signal", handle_signal)
     app.router.add_get("/ws/audio", handle_audio)
     app.router.add_get("/ws/vitals", handle_vitals)
     app.router.add_get("/ws/dashboard", handle_dashboard)
-    app.router.add_static("/", path="./static", name="static", show_index=True)
+    app.router.add_static("/static", path="./static", name="static")
     return app
+```
 
+Routes summary:
+| Route | Type | Purpose |
+|---|---|---|
+| `/` | GET | Dashboard HTML |
+| `/api/turn-credentials` | GET | Dynamic TURN creds |
+| `/static/` | Static | CSS, JS, assets |
+| `/ws/signal` | WS | Signaling + call lifecycle |
+| `/ws/audio` | WS | Audio PCM + JPEG frames |
+| `/ws/vitals` | WS | Vitals relay |
+| `/ws/dashboard` | WS | Dispatcher communication |
 
+```python
 if __name__ == "__main__":
     import ssl as _ssl
     port = int(os.environ.get("PORT", 8080))
@@ -461,9 +290,6 @@ if __name__ == "__main__":
     if ssl_cert and ssl_key:
         ssl_context = _ssl.create_default_context(_ssl.Purpose.CLIENT_AUTH)
         ssl_context.load_cert_chain(ssl_cert, ssl_key)
-        logger.info(f"Starting with TLS on port {port}")
-    else:
-        logger.info(f"Starting without TLS on port {port} (local dev)")
 
     web.run_app(create_app(), port=port, ssl_context=ssl_context)
 ```
@@ -473,66 +299,72 @@ if __name__ == "__main__":
 ## Environment Variables
 
 ```bash
-export GEMINI_API_KEY="your-gemini-api-key"
-export PORT=8080  # optional, defaults to 8080
+GEMINI_API_KEY="your-gemini-api-key"   # Required
+TURN_SECRET="shared-secret-with-coturn" # Required for /api/turn-credentials
+PORT=8080                               # Optional, defaults to 8080
+SSL_CERT="/path/to/fullchain.pem"       # Optional, for TLS termination
+SSL_KEY="/path/to/privkey.pem"          # Optional, for TLS termination
 ```
 
-In production on Vultr, SSL termination is handled by the server process itself using aiohttp's SSL context. See `deployment.md` for the full SSL setup with Let's Encrypt.
+Uses `python-dotenv` — place a `.env` file in the server directory for local development. In production on Vultr, SSL termination is handled by the server process itself. See `deployment.md` for the full SSL + coturn setup.
 
 ---
 
-## Gemini Session Lifecycle
+## Gemini Analysis Lifecycle
 
-Each call gets one Gemini session. The session task starts when the **dispatcher joins** (not at `call_initiated`) to avoid burning RPD quota while waiting for a dispatcher to answer. Audio chunks enqueued before the session starts are processed immediately once Gemini connects. The session task runs as an asyncio `Task` and communicates via a bounded `asyncio.Queue(maxsize=500)`:
+Each call gets one Gemini analysis loop (not a persistent session). The task starts when the **dispatcher joins** (not at `call_initiated`) to save API quota.
 
 ```
 iOS audio tap → /ws/audio handler → audio_queue.put()
                                            ↓
-                                  gemini_session_task
-                                  consumes from queue
-                                  sends to Gemini Live API
+                                  gemini_session_task (every 10s)
+                                  drains queue → PCM buffer
+                                  wraps in WAV via pcm_to_wav()
+                                  + latest JPEG frame
+                                  + previous_summary context
                                            ↓
-                                  receives text responses
-                                  parses JSON
+                                  client.aio.models.generate_content()
+                                  model=gemini-2.5-flash, temp=0.1
                                            ↓
-                                  /ws/dashboard → dispatcher browser
+                                  parses JSON from response
+                                  stores situation_summary for next round
+                                           ↓
+                                  /ws/dashboard → triage_update
 ```
 
-### Session Limits
+### Cumulative Context
 
-- Audio-only mode: 15-minute maximum per session
-- At 14 minutes, the Gemini session will begin closing
-- For the hackathon: demos stay under 10 minutes, no reconnection needed
-- For production: implement session reconnection before the 15-minute mark
+Each analysis round receives the `previous_summary` from the last successful analysis. This gives Gemini continuity without maintaining a Live API session:
 
-### Rate Limits (Free Tier)
+```
+Round 1: "Analyze this 911 call audio clip. Output triage JSON."
+Round 2: "Previous analysis: {summary}. New audio segment (update #2). Update your triage."
+Round 3: "Previous analysis: {summary}. New audio segment (update #3). Update your triage."
+```
+
+### API Limits (Free Tier)
 
 - 10 requests per minute
 - 250,000 tokens per minute
 - 250 requests per day
-- 3 concurrent sessions
 
-A "request" in the Live API context means opening a session, not each message sent within it. 3 concurrent sessions = 3 simultaneous active calls. Fine for the demo.
-
-### Token Budget per 10-min Call
-
-| Source | Tokens |
-|---|---|
-| Audio (25 tokens/s × 600s) | ~15,000 |
-| System prompt | ~300 |
-| Vitals context injections | ~1,000 |
-| Gemini output | ~2,000 |
-| **Total** | **~18,300** |
-
-Well under the 250K TPM limit.
+With 10-second intervals, one call uses ~6 RPM. Two simultaneous calls would approach the 10 RPM limit. For the hackathon demo, one call at a time is safe.
 
 ### Error Handling
 
-```python
-# 429 (rate limit): WebSocket closes. Implement exponential backoff.
-# Session expiry: Gemini sends "going away" before closing.
-# For hackathon: log errors, let the demo handle gracefully.
+On Gemini API failure, the server sends an error triage_update to the dashboard:
+```json
+{
+  "type": "triage_update",
+  "call_id": "...",
+  "report": {
+    "situation_summary": "Gemini analysis error: ...",
+    "severity": 0
+  }
+}
 ```
+
+This prevents the dashboard from showing "Waiting for analysis..." indefinitely.
 
 ---
 
@@ -540,11 +372,23 @@ Well under the 250K TPM limit.
 
 ```bash
 cd server/
-export GEMINI_API_KEY="your-key"
+cp .env.example .env  # Add your GEMINI_API_KEY and TURN_SECRET
 python3 server.py
 ```
 
-The server listens on port 8080 by default. For local testing, iOS must connect via IP address (not localhost — the phone is a separate device). Use `http://your-mac-ip:8080` and note that WebRTC requires HTTPS in production — for local dev, you can temporarily disable that check or use a self-signed cert.
+The server listens on port 8080 by default. For local testing, iOS must connect via your Mac's IP address. For testing with ngrok, set the server URL in the iOS `Config.swift` accordingly.
+
+---
+
+## Testing
+
+```bash
+cd server/
+pip install -r requirements.txt  # Includes pytest, pytest-aiohttp, pytest-asyncio
+pytest tests/
+```
+
+Tests in `tests/test_server.py` verify WebSocket handler behavior using `aiohttp.test_utils`. See `tests/conftest.py` for shared fixtures.
 
 ---
 
@@ -556,10 +400,10 @@ See `CLAUDE.md` for the full message schema. Quick reference:
 
 **iOS → Server (via /ws/audio):** binary PCM, `{ type: "frame", data: "<base64 JPEG>" }`
 
-**iOS → Server (via /ws/vitals):** `{ type: "vitals", hr, hrConfidence, breathing, breathingConfidence, timestamp }`
+**iOS → Server (via /ws/vitals):** `{ type: "vitals", call_id, hr, hrConfidence, breathing, breathingConfidence, timestamp }`
 
 **Server → iOS:** `dispatcher_ready`, `call_ended`, WebRTC SDP/ICE
 
-**Server → Dashboard (/ws/dashboard):** `incoming_call`, `triage_update`, `critical_flag`, `vitals`, `call_ended`
+**Server → Dashboard (/ws/dashboard):** `incoming_call`, `triage_update`, `vitals`, `call_ended`
 
 **Dashboard → Server (/ws/dashboard):** `dispatcher_joined`, `call_ended`, WebRTC SDP/ICE

@@ -7,7 +7,7 @@
 | Python server | Vultr Ubuntu VPS | WebSocket server, Gemini relay, static file host |
 | coturn | Same VPS, separate process | STUN/TURN for WebRTC NAT traversal |
 | SSL | Let's Encrypt (certbot) | TLS for WSS and HTTPS |
-| Domain | Any registrar | Required for SSL + coturn TLS |
+| Domain | visual911.mooo.com (freedns) | Required for SSL + coturn TLS |
 
 Minimum VPS: Vultr $6/month (1 vCPU, 1GB RAM). Sufficient for a hackathon with 1 active call at a time.
 
@@ -29,14 +29,14 @@ ssh root@YOUR_VPS_IP
 In your DNS registrar, create an A record:
 
 ```
-yourdomain.com  →  YOUR_VPS_IP
+visual911.mooo.com  →  YOUR_VPS_IP
 ```
 
 Wait for DNS propagation (can be instant to 30 minutes with TTL=60).
 
 Verify:
 ```bash
-dig yourdomain.com +short
+dig visual911.mooo.com +short
 # Should return YOUR_VPS_IP
 ```
 
@@ -48,7 +48,8 @@ dig yourdomain.com +short
 apt update && apt upgrade -y
 apt install -y python3 python3-pip coturn certbot ufw
 
-pip3 install aiohttp google-genai --break-system-packages
+cd /opt/visual911
+pip3 install -r server/requirements.txt --break-system-packages
 ```
 
 ---
@@ -70,11 +71,11 @@ ufw enable
 ## Step 5: SSL Certificate
 
 ```bash
-certbot certonly --standalone -d yourdomain.com
+certbot certonly --standalone -d visual911.mooo.com
 
 # Certificates will be at:
-# /etc/letsencrypt/live/yourdomain.com/fullchain.pem
-# /etc/letsencrypt/live/yourdomain.com/privkey.pem
+# /etc/letsencrypt/live/visual911.mooo.com/fullchain.pem
+# /etc/letsencrypt/live/visual911.mooo.com/privkey.pem
 
 # Auto-renewal (certbot installs a systemd timer automatically)
 # Verify: systemctl status certbot.timer
@@ -94,10 +95,10 @@ fingerprint
 use-auth-secret
 static-auth-secret=GENERATE_A_RANDOM_SECRET_HERE
 
-realm=yourdomain.com
+realm=visual911.mooo.com
 
-cert=/etc/letsencrypt/live/yourdomain.com/fullchain.pem
-pkey=/etc/letsencrypt/live/yourdomain.com/privkey.pem
+cert=/etc/letsencrypt/live/visual911.mooo.com/fullchain.pem
+pkey=/etc/letsencrypt/live/visual911.mooo.com/privkey.pem
 
 total-quota=100
 no-multicast-peers
@@ -147,9 +148,10 @@ mkdir -p /opt/visual911/static
 ```bash
 cat > /opt/visual911/.env << 'EOF'
 GEMINI_API_KEY=your-gemini-api-key-here
+TURN_SECRET=SAME_SECRET_AS_COTURN_STATIC_AUTH_SECRET
 PORT=443
-SSL_CERT=/etc/letsencrypt/live/yourdomain.com/fullchain.pem
-SSL_KEY=/etc/letsencrypt/live/yourdomain.com/privkey.pem
+SSL_CERT=/etc/letsencrypt/live/visual911.mooo.com/fullchain.pem
+SSL_KEY=/etc/letsencrypt/live/visual911.mooo.com/privkey.pem
 EOF
 ```
 
@@ -223,25 +225,17 @@ journalctl -u visual911 -f
 
 In `ios/Config.swift`:
 ```swift
-static let serverHost = "wss://yourdomain.com"
+static let serverHost = "wss://visual911.mooo.com"
 ```
 
-In `dashboard/index.html`, update the TURN credentials using the secret from Step 6:
-
-```python
-# Generate credentials locally (Python):
-import hmac, hashlib, base64, time
-
-secret = "YOUR_COTURN_SECRET"
-expiry = int(time.time()) + 86400  # 24 hours
-username = f"{expiry}:visual911"
-credential = base64.b64encode(hmac.new(secret.encode(), username.encode(), hashlib.sha1).digest()).decode()
-
-print(f"username: {username}")
-print(f"credential: {credential}")
+In `ios/Secrets.swift`, set the TURN secret matching the coturn `static-auth-secret`:
+```swift
+static let turnSecret = "SAME_SECRET_AS_COTURN"
 ```
 
-Paste these into both `dashboard/index.html` and the iOS TURN credential generation code.
+**Dashboard TURN credentials are automatic.** The dashboard fetches time-limited credentials from `/api/turn-credentials` on each call — no hardcoded TURN creds needed in `index.html`. The server uses the `TURN_SECRET` env var (Step 8) to generate HMAC-SHA1 credentials matching coturn's `static-auth-secret`.
+
+The iOS app generates its own TURN credentials locally using `TURNCredentials.swift` with the same shared secret.
 
 ---
 
@@ -249,15 +243,15 @@ Paste these into both `dashboard/index.html` and the iOS TURN credential generat
 
 ```bash
 # 1. Server responding
-curl -k https://yourdomain.com/
+curl -k https://visual911.mooo.com/
 # Should serve index.html
 
 # 2. WebSocket reachable (install wscat: npm install -g wscat)
-wscat -c wss://yourdomain.com/ws/signal?call_id=test&role=caller
+wscat -c wss://visual911.mooo.com/ws/signal?call_id=test&role=caller
 # Should connect without error
 
 # 3. coturn TURN working
-turnutils_uclient -T yourdomain.com -e YOUR_VPS_IP
+turnutils_uclient -T visual911.mooo.com -e YOUR_VPS_IP
 # Should complete relay test
 ```
 
@@ -298,7 +292,7 @@ journalctl -u coturn -n 50
 
 **SSL cert not found:**
 ```bash
-ls /etc/letsencrypt/live/yourdomain.com/
+ls /etc/letsencrypt/live/visual911.mooo.com/
 # fullchain.pem and privkey.pem should exist
 certbot renew --dry-run  # Test renewal
 ```
@@ -306,4 +300,5 @@ certbot renew --dry-run  # Test renewal
 **iOS can't connect:**
 - Confirm `Config.swift` has `wss://` not `ws://`
 - Confirm port 443 is open in firewall
-- Test from browser first: open `https://yourdomain.com` — if dashboard loads, network is fine
+- Test from browser first: open `https://visual911.mooo.com` — if dashboard loads, network is fine
+- Verify TURN credentials: `curl https://visual911.mooo.com/api/turn-credentials` should return JSON with username, credential, uris
